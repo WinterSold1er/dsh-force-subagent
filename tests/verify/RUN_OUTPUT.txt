@@ -1,0 +1,31 @@
+$ node --test tests/verify/
+# generated: 2026-11-02 15:24:40 CST  index.js sha256=d2a7c2e239f66ee787beb229ce67404b6a8b1fe1a228d06f81389072e2c1b24c
+
+✔ T1 命令注册名精确为 using-agent-team (1.780481ms)
+✔ T2 新 session 未 invoke → 空串 (1.928686ms)
+✔ T3 invoke 后同一 session → 提醒含关键词与任务原文；裸命令仍单行 (2.120316ms)
+✔ T4 args 为 off（含大小写/前导空白）→ 空串 (0.449715ms)
+✔ T5 最后一条记录生效：on → off → on (0.510654ms)
+✔ T6 无关命令（clear）不触发 (0.240429ms)
+✔ T7 会话隔离（双向）：B 先 on 不影响 A；A on、B on→off 后 A 仍开 (0.315556ms)
+✔ T8 幂等：重复 invoke 不叠加 (0.340955ms)
+✔ T9 handler 返回 success 且 text 非空 (0.342556ms)
+✔ T10 无伪造注入：未注册 agent/pre-step，返回值里不含消息（投递走 agent.steer/inject） (0.475559ms)
+✔ T11 诊断路径：context 缺 agent/session 时 text 返回空串且不抛 (0.349ms)
+✔ T12 snapshotEvents 路径：无 .events、返回值被冻结 (0.326502ms)
+✔ T13 依赖声明：apply 期间 get 的服务全部在模块 inject 数组内 (0.177387ms)
+✔ T14 不可变：handler 不写 session 日志、不改写 agent (0.970583ms)
+✔ T15 裸命令：data 无 args 字段与 args:"" 都必须开启 (0.222762ms)
+✔ T16 handler on/off 文案语义：on 与 off 都必须成功且文案互斥 (0.286508ms)
+✔ T17 handler 返回形状防漂移：恒为 { kind, text } 对象 (0.226011ms)
+✔ T18 每次 invoke 都投递模型可见 notice：带 task 走 steer，其余走 inject (0.412ms)
+ℹ tests 18
+ℹ suites 0
+ℹ pass 18
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 124.135883
+
+EXIT CODE: 0
