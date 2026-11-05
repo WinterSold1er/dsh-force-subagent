@@ -41,6 +41,15 @@ function createHost({ systemPrompt = createSystemPrompt(), commands = createComm
   const onCalls = []
   const ctx = {
     logger: { warn: (message) => warnings.push(message) },
+    effect: (factory) => factory(),
+    fiber: { uid: 'test-fiber' },
+    settings: { configure: () => () => {} },
+    inject: (deps, callback) => callback({
+      effect: (factory) => factory(),
+      fiber: ctx.fiber ?? { uid: 'test-fiber' },
+      settings: ctx.settings ?? { configure: () => () => {} },
+      logger: ctx.logger,
+    }),
     get: (service) => (service === 'systemPrompt' ? systemPrompt : service === 'commands' ? commands : service === 'agentTeams' ? agentTeams : undefined),
     on: (...args) => {
       onCalls.push(args)

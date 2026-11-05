@@ -87,6 +87,13 @@ PROFILE_PKG="$PROFILE_REAL/package.json"
 LINK_DIR="$PROFILE_REAL/node_modules"
 LINK_PATH="$LINK_DIR/$PLUGIN_NAME"
 
+# Node resolves the plugin's imports from PLUGIN_REAL, so the profile copy of
+# @deepseek-ai/schemastery is mirrored into the checkout as a symlink.
+SCHEMA_SRC="$LINK_DIR/@deepseek-ai/schemastery"
+SCHEMA_ROOT="$PLUGIN_DIR/node_modules"
+SCHEMA_DIR="$SCHEMA_ROOT/@deepseek-ai"
+SCHEMA_LINK="$SCHEMA_DIR/schemastery"
+
 # ---- JSON editor -----------------------------------------------------------
 # Exits 0 when nothing needs to change, 10 when a change was (or would be) made.
 JSON_EDIT=$(cat <<'EOF'
@@ -274,13 +281,94 @@ uninstall_symlink() {
   fi
 }
 
+# ---- schemastery mirror symlink --------------------------------------------
+install_schemastery_link() {
+  local resolved=''
+
+  [ -d "$SCHEMA_SRC" ] || fail "missing $SCHEMA_SRC; install @deepseek-ai/schemastery in $DSH_PROFILE_DIR first"
+  if [ -e "$SCHEMA_ROOT" ] && [ ! -d "$SCHEMA_ROOT" ]; then
+    fail "$SCHEMA_ROOT exists and is not a directory"
+  fi
+  if [ -L "$SCHEMA_LINK" ]; then
+    if ! resolved=$(readlink -f -- "$SCHEMA_LINK"); then
+      fail "$SCHEMA_LINK is a dangling symlink; refusing to touch it"
+    fi
+    if [ "$resolved" = "$SCHEMA_SRC" ]; then
+      printf 'already linked: %s -> %s\n' "$SCHEMA_LINK" "$SCHEMA_SRC"
+      return 0
+    fi
+    fail "$SCHEMA_LINK points to $resolved, expected $SCHEMA_SRC; refusing to replace it"
+  fi
+  if [ -e "$SCHEMA_LINK" ]; then
+    fail "$SCHEMA_LINK exists and is not a symlink; refusing to replace it (remove it manually)"
+  fi
+
+  if [ ! -d "$SCHEMA_DIR" ]; then
+    if [ "$DRY_RUN" = true ]; then
+      printf 'would create directory %s\n' "$SCHEMA_DIR"
+    else
+      mkdir -p -- "$SCHEMA_DIR"
+      printf 'created directory %s\n' "$SCHEMA_DIR"
+    fi
+  fi
+
+  if [ "$DRY_RUN" = true ]; then
+    printf 'would create symlink %s -> %s\n' "$SCHEMA_LINK" "$SCHEMA_SRC"
+  else
+    ln -s -- "$SCHEMA_SRC" "$SCHEMA_LINK"
+    printf 'created symlink %s -> %s\n' "$SCHEMA_LINK" "$SCHEMA_SRC"
+  fi
+  CHANGED=$((CHANGED + 1))
+}
+
+uninstall_schemastery_link() {
+  local resolved=''
+  local dir
+
+  if [ -L "$SCHEMA_LINK" ]; then
+    if ! resolved=$(readlink -f -- "$SCHEMA_LINK"); then
+      printf 'warning: %s is a dangling symlink; leaving it in place\n' "$SCHEMA_LINK" >&2
+      return 0
+    fi
+    if [ "$resolved" != "$SCHEMA_SRC" ]; then
+      printf 'warning: %s points to %s, not %s; leaving it in place\n' \
+        "$SCHEMA_LINK" "$resolved" "$SCHEMA_SRC" >&2
+      return 0
+    fi
+    if [ "$DRY_RUN" = true ]; then
+      printf 'would remove symlink %s\n' "$SCHEMA_LINK"
+    else
+      rm -f -- "$SCHEMA_LINK"
+      printf 'removed symlink %s\n' "$SCHEMA_LINK"
+    fi
+    CHANGED=$((CHANGED + 1))
+  elif [ -e "$SCHEMA_LINK" ]; then
+    printf 'warning: %s is not a symlink; leaving it in place\n' "$SCHEMA_LINK" >&2
+    return 0
+  fi
+
+  # rmdir only succeeds on an empty directory, so foreign content is never lost.
+  for dir in "$SCHEMA_DIR" "$SCHEMA_ROOT"; do
+    if [ -d "$dir" ]; then
+      if [ "$DRY_RUN" = true ]; then
+        printf 'would remove directory %s if empty\n' "$dir"
+      elif rmdir -- "$dir" 2>/dev/null; then
+        printf 'removed directory %s\n' "$dir"
+        CHANGED=$((CHANGED + 1))
+      fi
+    fi
+  done
+}
+
 # ---- run -------------------------------------------------------------------
 if [ "$MODE" = install ]; then
   install_symlink
+  install_schemastery_link
   edit_profile_json
 else
   edit_profile_json
   uninstall_symlink
+  uninstall_schemastery_link
 fi
 
 if [ "$CHANGED" -eq 0 ]; then

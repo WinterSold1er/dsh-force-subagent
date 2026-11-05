@@ -82,6 +82,9 @@ fi
 
 先做下一节的验证，再由用户手动重启 host；本流程不自动重启。
 
+
+> **前置依赖：先跑 `./scripts/install.sh` 建立 `@deepseek-ai/schemastery` 软链。** 插件用它在 `index.js` 里声明 `Config`（根 `volatile`）；**软链缺失时插件加载即失败**（`ERR_MODULE_NOT_FOUND`），宿主不会启动本插件。脚本是幂等的，可重复执行。
+
 ## 验证（不重启、不启动新服务）
 
 `--dump-config` 是一个全新的 CLI 进程，读取 profile 并装配 bundle，因此能在重启前验证接线是否正确；它不能证明运行中的 :3080 进程已加载插件（那需要重启）。
@@ -124,7 +127,7 @@ cd /home/csy/.dsh/profiles/web && node --input-type=module -e "console.log(impor
 node --input-type=module -e "import('/home/csy/Code/Github/dsh-force-subagent/index.js').then(m=>console.log(m.inject))"
 ```
 
-期望：`[ 'commands', 'systemPrompt' ]`（若看到 `agentTeams`，说明加载的是旧版，需重启 host）
+期望：`[ 'commands', 'systemPrompt', 'subagents' ]`（若看到 `agentTeams` 或缺少 `subagents`，说明加载的是旧版，需重启 host）
 
 ### 4. 失败排查
 
@@ -138,7 +141,7 @@ node --input-type=module -e "import('/home/csy/Code/Github/dsh-force-subagent/in
 
 ## 生效：必须手动重启 host
 
-> **警告：本插件不会热加载。** profile 的依赖与 bundle 在 host 启动时装配，运行中的 :3080 进程不会读取新配置。安装或卸载后，只有重启 host 才生效。
+> **警告：profile 的依赖与 bundle 不会热加载。** 它们在 host 启动时装配，运行中的 :3080 进程不会读取新配置。安装或卸载后，只有重启 host 才生效。仅改浏览器侧 `client.js` 属例外：client-hmr 会自动重建并重跑 `apply`，无需重启。
 >
 > **重启会终止当前 agent 会话**（当前工具调用由该 host 托管）。务必在会话外的外部终端或独立进程中操作，不要在本 agent 会话内直接重启。本仓库脚本故意不重启，重启方式由你按部署自行决定；本环境提供的 `restarting-dsh-host-service` skill 说明了在宿主 cgroup 内以 detached 方式重启的做法，可参考。不要臆测 systemd 单元名。
 
@@ -183,10 +186,10 @@ cp -p /home/csy/.dsh/profiles/web/package.json.bak-<TS> /home/csy/.dsh/profiles/
 
 ## 风险与限制
 
-- **不热加载**：安装、卸载、改插件源码后都必须重启 host。
+- **热加载只覆盖浏览器半边**：安装、卸载、改宿主侧 `index.js` 后必须重启 host；只改 `client.js` 由 client-hmr 自动重建并重跑 `apply`，通常无需重启（见 README §部署）。
 - **`file:` 依赖是绝对路径**：仓库移动或改名后，`dependencies` 与 symlink 都会失效，需改路径后重跑脚本。
 - **symlink 与 `pnpm install`**：本仓库不运行 `pnpm install`。若你自行在 profile 里运行，pnpm 可能重写 `node_modules`，链接可能丢失或变成实体副本；恢复方式是重跑 `./scripts/install.sh`。
-- **改插件源码无需重装**：symlink 直连仓库，改完重启 host 即可；但仓库移动仍需重跑脚本。
+- **改插件源码无需重装**：symlink 直连仓库，改宿主侧 `index.js` 后重启 host 即生效，改浏览器侧 `client.js` 走 client-hmr 无需重启；但仓库移动仍需重跑脚本。
 - **开关按会话、可追溯**：门控直接派生自会话内的 `command/run` 事件，执行命令后的下一轮即生效，无需等新消息批次；重启后仍存活或恢复的会话只要事件还在，就继续注入。
 - **注入范围**：插件只在**执行过 `/using-agent-team`** 的会话注入（`on` / `<task>` 同样算开启，`off` 关闭）；未执行命令的会话不注入。`commands` 或 `systemPrompt` 服务缺失时插件 warn 并停用（无任何注入）。
 - **engines 门禁**：DSH 低于 `0.2.1-rc.1` 时不要改插件绕过，升级宿主。

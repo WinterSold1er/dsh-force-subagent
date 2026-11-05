@@ -38,6 +38,15 @@ function createHost({ systemPrompt = createSystemPrompt(), commands = createComm
     on: (...args) => {
       onCalls.push(args)
     },
+    effect: (factory) => factory(),
+    fiber: { uid: 'test-fiber' },
+    settings: { configure: () => () => {} },
+    inject: (deps, callback) => callback({
+      effect: (factory) => factory(),
+      fiber: ctx.fiber ?? { uid: 'test-fiber' },
+      settings: ctx.settings ?? { configure: () => () => {} },
+      logger: ctx.logger,
+    }),
   }
   return { ctx, warnings, onCalls, systemPrompt, commands, agentTeams }
 }
@@ -59,7 +68,7 @@ test('apply 注册命令与 systemPrompt section，声明 inject、不监听 age
   apply(host.ctx)
 
   assert.equal(plugin.name, 'force-subagent')
-  assert.deepEqual(plugin.inject, ['commands', 'systemPrompt'], '必须声明 inject 让 Cordis 门控 apply')
+  assert.deepEqual(plugin.inject, ['commands', 'systemPrompt', 'subagents'], '必须声明 inject 让 Cordis 门控 apply')
 
   const section = sectionOf(host)
   assert.equal(section.name, 'force-subagent:agent-team')

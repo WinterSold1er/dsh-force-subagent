@@ -78,7 +78,14 @@ function harness() {
       return services[name]
     },
     inject(deps, callback) {
-      callback(ctx)
+      // 真实 Cordis 的回调收到带 effect 的 child scope；裸 ctx 缺 effect，
+      // 会让 index.js 的延迟注入（settings 策略）在 child.effect 处抛错。
+      callback({
+        effect: (factory) => factory(),
+        fiber: ctx.fiber ?? { uid: 'test-fiber' },
+        settings: ctx.settings ?? { configure: () => () => {} },
+        logger: ctx.logger,
+      })
       return () => {}
     },
     on(event, listener) {

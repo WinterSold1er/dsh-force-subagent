@@ -1,22 +1,41 @@
 {
   "name": "dsh-force-subagent",
   "version": "0.1.0",
-  "description": "DeepSeek Harness 宿主插件：在 Agent Teams 会话中按角色注入强制委派提示（Lead 编排、teammate 派发 subagent）。零依赖、无构建。",
+  "description": "DeepSeek Harness 宿主插件：在 Agent Teams 会话中按角色注入强制委派提示（Lead 编排、teammate 派发 subagent）。无自带运行时依赖、无构建；Config 用宿主提供的 @deepseek-ai/schemastery 声明（install.sh 建软链）。",
   "private": true,
   "type": "module",
   "exports": {
     ".": "./index.js",
+    "./client": "./client.js",
+    "./icon": "./icon.svg",
     "./package.json": "./package.json"
   },
   "files": [
     "index.js",
+    "client.js",
+    "icon.svg",
     "cordis.patch.yml",
     "README.md"
   ],
+  "icon": "./icon.svg",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-api-workspace-controller"
+      ]
     }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.4"
   },
   "keywords": [
     "dsh",

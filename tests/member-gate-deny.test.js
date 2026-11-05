@@ -48,6 +48,12 @@ const DENY_TOOLS = [
 function createHost({ agentTeams } = {}) {
   const onCalls = []
   const ctx = {
+    inject: (deps, callback) => callback({
+      effect: (factory) => factory(),
+      fiber: ctx.fiber ?? { uid: 'test-fiber' },
+      settings: ctx.settings ?? { configure: () => () => {} },
+      logger: ctx.logger,
+    }),
     logger: { warn: () => {} },
     get: (service) => (service === 'agentTeams' ? agentTeams : undefined),
     on: (...args) => {

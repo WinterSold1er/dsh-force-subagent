@@ -38,6 +38,15 @@ function createHost({ agentTeams } = {}) {
   }
   const ctx = {
     logger: { warn: (message) => warnings.push(message) },
+    effect: (factory) => factory(),
+    fiber: { uid: 'test-fiber' },
+    settings: { configure: () => () => {} },
+    inject: (deps, callback) => callback({
+      effect: (factory) => factory(),
+      fiber: ctx.fiber ?? { uid: 'test-fiber' },
+      settings: ctx.settings ?? { configure: () => () => {} },
+      logger: ctx.logger,
+    }),
     get: (service) => services[service],
     on: (...args) => {
       onCalls.push(args)
