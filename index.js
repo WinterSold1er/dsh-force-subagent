@@ -8,8 +8,9 @@
  * 命令 handler 返回会话页可见的一行结果，同时投递一条模型可见的 user notice：
  * 带 task 走 agent.steer（空闲起一轮、运行中下一步送达），其余走 agent.inject（不唤醒）。
  * task 随 `command/run` 事件持久在 section 里，直到 `off`。不写任何自定义状态。
- * tools/pre-execute：成员侧与 flat 模式成员侧是软门禁（放行 + 投递一次模型可见提醒，复用 agent.inject 通道）；
- * Lead 侧取证门禁是硬门禁（本轮没有委派、没有 running 成员，或本轮刚中断过成员 → 返回 { kind:'deny', reason }）。
+ * tools/pre-execute：成员侧、flat 模式成员侧与 Lead 侧一律是软门禁（放行 + 投递一次模型可见提醒，复用 agent.inject 通道）；
+ * 插件在任何判据下都不返回拒绝结果。Lead 侧判据只看「本轮（事件里最后一个 turn/start 之后）有没有委派类派发」：
+ * 没有派发就动取证 / 实现 / 执行工具 → 投递一条提醒并照常放行；去重按轮次刷新，Lead 收到新消息（新的 turn/start）后再动这些工具会重新提醒一次。
  */
 
 import { randomUUID } from 'node:crypto'
@@ -335,10 +336,10 @@ const SECTION_NAME = 'force-subagent:agent-team'
 // director 的 orchestrate section 用 55；57 相邻但不与宿主 SECTION_ORDERS 撞值。
 const SECTION_ORDER = 57
 
-const LEAD_NUDGE = '本会话已启用 Agent-Team 强制委派提示（/using-agent-team off 可关闭）。Lead：不要独自实现；先用 team_task_create 把工作拆成互不依赖的小任务（blocked_by 只写真实依赖、write_scopes 互斥），再在单轮内并行 spawn 拉起全部初始成员，不要串行建一个等一个；然后先推进可做的工作，仅在确实被阻塞时才 wait_agent 一次（同一 turn 不得连续两次），收到结果立即处理；你只做架构、拆解、调度、仲裁与最终验收，细节实现全部派发。【Lead 硬门禁，先说清再被拒】你自己动取证工具 bash / pwsh / read / read_image / grep / glob / web_fetch / web_search，自己动实现工具 write / edit / apply_patch / str_replace_editor，或自己动执行工具 run_code / terminal_open / terminal_read / terminal_send / terminal_signal（run_code 能在程序里读文件、写文件、跑命令；terminal_* 是跨 turn 存活的持久 shell），本轮既没有 spawn_teammate / subagent 派发、会话里也没有 running 成员时会被直接拒绝：工具不执行，返回 deny，正文前缀 [team-gate] LEAD_EVIDENCE_DENIED:。被拒后唯一出路是先 team_task_create 拆分任务，再在单轮内并行 spawn_teammate 派成员承接；换别的工具做同一件事同样会被拒。'
+const LEAD_NUDGE = '本会话已启用 Agent-Team 强制委派提示（/using-agent-team off 可关闭）。Lead：不要独自实现；先用 team_task_create 把工作拆成互不依赖的小任务（blocked_by 只写真实依赖、write_scopes 互斥），再在单轮内并行 spawn 拉起全部初始成员，不要串行建一个等一个；然后先推进可做的工作，仅在确实被阻塞时才 wait_agent 一次（同一 turn 不得连续两次），收到结果立即处理；你只做架构、拆解、调度、仲裁与最终验收，细节实现全部派发。【Lead 委派提醒，每轮首次动这些工具会收到一次】你自己动取证工具 bash / pwsh / read / read_image / grep / glob / web_fetch / web_search，自己动实现工具 write / edit / apply_patch / str_replace_editor，或自己动执行工具 run_code / terminal_open / terminal_read / terminal_send / terminal_signal（run_code 能在程序里读文件、写文件、跑命令；terminal_* 是跨 turn 存活的持久 shell），本轮还没有 spawn_teammate / subagent 派发时，每轮首次动这些工具会收到一条前缀 [team-gate] 的提醒，工具照常执行；收到新消息开新一轮后，同一判据会再提醒一次。正确做法是先 team_task_create 拆分任务，再在单轮内并行 spawn_teammate 派成员承接；本轮已经派发过就不再重复提醒。'
 
 /** flat 模式追加在 Lead nudge 之后的一节：成员收敛动作 + 宿主无删除成员 API 的事实，防止模型假装删除成员。 */
-const FLAT_LEAD_APPENDIX = '\n\n【flat 模式：只用成员，不派子代理】成员自己执行，成员的 subagent / subagent_fork / subagent_role / close_subagent / workflow 会被门禁放行但立即提醒（提醒前缀 [team-gate]）。你每收到一条成员消息，必须先判定该成员本次任务是否完成：已完成 → 立即 interrupt_agent 中断该成员，并用 team_task_update 关闭对应任务，此后永不再向该成员 send_message、不得复用该成员；未完成 → 继续给该成员派活。这条不靠提示词自觉也不靠硬拦：向已完成成员 send_message、或把任务 team_task_update 的 claim / reassign 落到已完成成员头上，工具调用仍会成功，但门禁会立即投递一条前缀 [team-gate] TEAM_MEMBER_FINISHED: 的提醒——看到它就该收手。需要新活就 spawn_teammate 新建一个新名字的成员承接。构建团队时把工作拆成互不依赖的小任务（write_scopes 互斥、blocked_by 只写真实依赖），在单轮内并行 spawn 多个成员一次拉齐，不要串行建一个等一个。注意：宿主没有删除 Team 成员的 API（没有删除工具、没有 TeamService 删除方法，roster 行 append-only，成员名永不复用，active / failed 是硬终态），软踢出只能做到「interrupt_agent 中断其当前 turn + 不再 send_message 唤醒」，成员记录仍然存在——不要声称或假装删除成员。【flat 模式 Lead 硬拦同样生效】flat 不放宽 Lead 门禁：Lead 自己的实现工具 write / edit / apply_patch / str_replace_editor、取证工具 bash / pwsh / read / read_image / grep / glob / web_fetch / web_search 与执行工具 run_code / terminal_open / terminal_read / terminal_send / terminal_signal，在本轮没有 spawn_teammate 派发、会话也没有 running 成员时会被硬拒——deny 前缀 [team-gate] LEAD_EVIDENCE_DENIED:，工具不执行。实现与取证都必须委派：唯一出路是先 team_task_create 拆分，再在单轮内并行 spawn_teammate 让成员承接；成员自己执行这些工具不受该门禁限制。'
+const FLAT_LEAD_APPENDIX = '\n\n【flat 模式：只用成员，不派子代理】成员自己执行，成员的 subagent / subagent_fork / subagent_role / close_subagent / workflow 会被门禁放行但立即提醒（提醒前缀 [team-gate]）。你每收到一条成员消息，必须先判定该成员本次任务是否完成：已完成 → 立即 interrupt_agent 中断该成员，并用 team_task_update 关闭对应任务，此后永不再向该成员 send_message、不得复用该成员；未完成 → 继续给该成员派活。这条不靠提示词自觉也不靠硬拦：向已完成成员 send_message、或把任务 team_task_update 的 claim / reassign 落到已完成成员头上，工具调用仍会成功，但门禁会立即投递一条前缀 [team-gate] TEAM_MEMBER_FINISHED: 的提醒——看到它就该收手。需要新活就 spawn_teammate 新建一个新名字的成员承接。构建团队时把工作拆成互不依赖的小任务（write_scopes 互斥、blocked_by 只写真实依赖），在单轮内并行 spawn 多个成员一次拉齐，不要串行建一个等一个。注意：宿主没有删除 Team 成员的 API（没有删除工具、没有 TeamService 删除方法，roster 行 append-only，成员名永不复用，active / failed 是硬终态），软踢出只能做到「interrupt_agent 中断其当前 turn + 不再 send_message 唤醒」，成员记录仍然存在——不要声称或假装删除成员。【flat 模式 Lead 提醒同样生效】flat 不放宽 Lead 门禁：Lead 自己的实现工具 write / edit / apply_patch / str_replace_editor、取证工具 bash / pwsh / read / read_image / grep / glob / web_fetch / web_search 与执行工具 run_code / terminal_open / terminal_read / terminal_send / terminal_signal，本轮还没有 spawn_teammate 派发时，每轮首次动这些工具会收到一条前缀 [team-gate] 的提醒，工具照常执行，新的 turn 开始后会再提醒一次。实现与取证都必须委派：出路是先 team_task_create 拆分，再在单轮内并行 spawn_teammate 让成员承接；成员自己执行这些工具不受该提醒约束。'
 
 // 成员会话没有自己的 command/run 记录，门控改由 Lead 会话的开关派生（见 text 回调与 tools/pre-execute 监听）。
 const MEMBER_NUDGE = '你是 Agent-Team 成员。本会话的 Lead 已启用强制委派提示（/using-agent-team off 可关闭）：除编排类与只读工具（subagent / subagent_fork / subagent_role / close_subagent / workflow / team_task_* / send_message / wait_agent / list_agents / interrupt_agent / job_* / skill / todo_write / read / grep / glob）外，其余工具会被门禁放行但立即提醒，仍必须委派；你只是编排者，加载必需技能后，本轮第一个业务工具调用必须是委派（subagent / subagent_fork / workflow），拆分子任务（写范围互斥）后单轮批量派发并在 team_task_* 看板登记，深度≤2；只有 read、grep、glob 可自己用来校验产物，自己只做拆分、合并与校验；阻塞时 wait_agent 只等一次，同一 turn 不得连续两次，收到结果立即处理。'
@@ -392,7 +393,7 @@ function deliver(agent, method, message, warn) {
   }
 }
 
-/** 放行白名单：成员会话默认拒绝一切工具，只有精确命中的编排类与只读工具放行（前缀匹配会放过 mcp__ 委派工具，故不用）。 */
+/** 放行白名单：nested 成员只有精确命中的编排类与只读工具直接放行（不再走点名提醒），其余工具提醒一次后照常执行；插件不拒绝任何成员工具（前缀匹配会放过 mcp__ 委派工具，故不用）。 */
 const ALLOWED_TOOLS = new Set([
   'subagent',
   'subagent_fork',
@@ -431,19 +432,19 @@ const flatGateReminder = (tool) =>
   `[team-gate] 提醒：flat 模式只用成员，成员不派子代理——「${tool}」本次已放行，但它不是成员的动作：读文件、改代码、跑命令、跑测试一律由你自己执行，做完后用 send_message 把结果交回 Lead，由 Lead 判定完成并 interrupt_agent 收敛你。`
 
 /**
- * Lead 取证门禁的点名工具：只列「取证 / 执行动作」（跑命令、读文件、读图片、搜内容、列文件、抓网页、搜网页），
- * 防的是 Lead 自己下场取证而不是委派。
+ * Lead 取证提醒的点名工具：只列「取证 / 执行动作」（跑命令、读文件、读图片、搜内容、列文件、抓网页、搜网页），
+ * 针对的是 Lead 自己下场取证而不是委派；命中只投递提醒，工具照常执行。
  * 旁路补齐：`read_image` 是真实的取证入口（读文件类的图片版），宿主注册名见
  * packages/fs/tool-fs/src/read-image.ts:211；`pwsh` 是 bash 的 PowerShell 等价物（同一执行能力，注册名见
  * packages/shell/tool-pwsh/src/index.ts:385）。持久化 pwsh（packages/shell/tool-pwsh-persistent/src/index.ts:428）
  * 注册的模型可见工具名同样是 `pwsh`，与 tool-pwsh 共用同一个名字，因此一条 'pwsh' 同时覆盖前台与持久化两条路。
- * 已知未覆盖：MCP 工具（模型可见名为 `mcp__<server>__<tool>`，由服务器自行决定、逐名硬拦不可行）不进本集合，
- * 只靠 LEAD_NUDGE 的「换别的工具做同一件事同样会被拒」承担告知。
+ * 已知未覆盖：MCP 工具（模型可见名为 `mcp__<server>__<tool>`，由服务器自行决定、逐名点名不可行）不进本集合，
+ * 只靠 LEAD_NUDGE 的委派要求承担告知。
  */
 const EVIDENCE_TOOLS = new Set(['bash', 'read', 'grep', 'glob', 'web_fetch', 'web_search', 'read_image', 'pwsh'])
 
 /**
- * Lead 实现工具的点名工具：封「Lead 被拒取证后直接 write / edit 把活做掉」这条绕行——只封取证不封动手
+ * Lead 实现工具的点名工具：覆盖「Lead 被提醒取证后转而直接 write / edit 把活做掉」这条绕行——只提醒取证不提醒动手
  * 等于门禁没有生效。名字逐个核对宿主注册名：write 见 packages/fs/tool-fs/src/write.ts:74，
  * edit 见 edit.ts:86，apply_patch 见 apply-patch.ts:27，str_replace_editor 见
  * packages/fs/tool-str-replace-editor/src/index.ts:430；宿主不存在 multi_edit 一类名字，一律不列。
@@ -451,55 +452,37 @@ const EVIDENCE_TOOLS = new Set(['bash', 'read', 'grep', 'glob', 'web_fetch', 'we
 const IMPLEMENTATION_TOOLS = new Set(['write', 'edit', 'apply_patch', 'str_replace_editor'])
 
 /**
- * Lead 执行面工具的点名工具：封「Lead 被拒 bash / write 之后改用宿主留下的另外两条执行通道」这条绕行——
- * 被拦的是「Lead 亲自干活」这件事，不是某两个工具名。名字逐个核对宿主 0.2.2-rc.1 真实注册名：
+ * Lead 执行面工具的点名工具：覆盖「Lead 被提醒 bash / write 之后改用宿主留下的另外两条执行通道」这条绕行——
+ * 提醒针对的是「Lead 亲自干活」这件事，不是某两个工具名。名字逐个核对宿主 0.2.2-rc.1 真实注册名：
  * `run_code` 见 packages/core/tool-executor-ptc/src/ptc.ts:298（`defineTool({ name: RUN_CODE_NAME })`，
  * 常量值 'run_code' 见 packages/core/tools/src/contracts.ts:12），模型可见名表见
  * packages/core/tools/tests/gen-tool-catalog.spec.ts:36；它是取证 + 实现的等价组合——程序内可经 SDK 再派发
- * 其它 agent-visible 工具，只封 bash / write 不封它等于门禁形同虚设。
+ * 其它 agent-visible 工具，只提醒 bash / write 不提醒它等于门禁形同虚设。
  * `terminal_open` / `terminal_send` / `terminal_read` / `terminal_signal` 见
  * packages/experimental/tool-terminal/src/index.ts:166 / :203 / :307 / :340（模型可见名表见同 spec :41-42）：
  * 持久终端会话就是可跨 turn 存活的 bash，宿主只有这一个注册点（tool-terminal 一个包同时提供持久与非持久后端，
  * 名字同一，一条覆盖两条路），没有第二个副本需要补。
  * `terminal_close`（:365）/ `terminal_list`（:396）刻意不列：它们只是终端会话的生命周期簿记，自身不执行任何
- * 东西，而终端只能由已被拦的 `terminal_open` 建立——Lead 拿不到可操作的终端。
+ * 东西，而终端只能由已在集合内的 `terminal_open` 建立——Lead 拿不到可操作的终端。
  */
 const EXECUTION_TOOLS = new Set(['run_code', 'terminal_open', 'terminal_read', 'terminal_send', 'terminal_signal'])
 
-/** Lead 侧硬拦总集合 = 取证类 + 实现类 + 执行类。委派与编排类工具（team_task_* / spawn_teammate / send_message / wait_agent / list_agents / interrupt_agent）一律不在其列。 */
+/** Lead 侧提醒触发集合 = 取证类 + 实现类 + 执行类：命中它只触发「本轮未派发」提醒，不构成拦截，插件不因此拒绝任何工具调用。委派与编排类工具（team_task_* / spawn_teammate / send_message / wait_agent / list_agents / interrupt_agent）一律不在其列。 */
 const LEAD_BLOCKED_TOOLS = new Set([...EVIDENCE_TOOLS, ...IMPLEMENTATION_TOOLS, ...EXECUTION_TOOLS])
 
 /** 「本轮已经把活派出去了」的判据：本 turn 内出现过委派类 tool/call 事件。 */
 const DISPATCH_TOOLS = new Set(['spawn_teammate', 'subagent', 'subagent_fork', 'subagent_role', 'workflow'])
 
-/** 被拦工具在 deny 文案里的归类名：实现类 / 执行类 / 取证类。三类的判据与出路完全相同，只有称呼不同。 */
+/** 被点名工具在提醒文案里的归类名：实现类 / 执行类 / 取证类。三类的判据与出路完全相同，只有称呼不同。 */
 const leadGateToolCategory = (tool) => {
   if (IMPLEMENTATION_TOOLS.has(tool)) return '实现工具'
   if (EXECUTION_TOOLS.has(tool)) return '执行工具'
   return '取证工具'
 }
 
-/** Lead 工具被硬拒的理由：点名被拦工具（取证类 / 实现类 / 执行类）与被拒原因，唯一出路是 team_task_create + spawn_teammate。 */
-const leadGateDenyReason = (tool, cause) =>
-  `[team-gate] LEAD_EVIDENCE_DENIED: ${leadGateToolCategory(tool)}「${tool}」已被拒绝——${cause} 实现与取证都必须委派${EXECUTION_TOOLS.has(tool) ? '，执行工具本身就是取证与实现的等价通道' : ''}：先 team_task_create 把工作拆成互不依赖的小任务（write_scopes 互斥、blocked_by 只写真实依赖），再在单轮内 spawn_teammate 并行派成员承接；Lead 只做拆分、派发、合并与校验。`
-
-/**
- * 「还有 running 成员」判定：同一 member.id 只认最后一条 team/member 快照的 phase（宿主事件是整值快照），
- * phase === 'failed' 是硬终态；再剔掉 finishedMembers（任务全部 completed / deleted 且无在办）的成员。
- * 只认 team/member 事件里的成员，Lead 自身不在其中，故 Lead 永远不会被算成 running 成员。
- */
-const hasRunningMember = (events) => {
-  const phaseById = new Map()
-  for (const event of Array.isArray(events) ? events : []) {
-    const member = event?.type === 'team/member' ? event?.data?.member : undefined
-    if (typeof member?.id === 'string') phaseById.set(member.id, member.phase)
-  }
-  const { finished } = finishedMembers(events)
-  for (const [id, phase] of phaseById) {
-    if (phase !== 'failed' && !finished.has(id)) return true
-  }
-  return false
-}
+/** Lead 本轮未派发时的提醒正文：点名工具（取证类 / 实现类 / 执行类）与正确做法；工具照常执行，不构成拒绝。 */
+const leadGateReminder = (tool) =>
+  `[team-gate] 提醒：本轮还没有派发成员，${leadGateToolCategory(tool)}「${tool}」仍会照常执行。正确做法：先 team_task_create 把工作拆成互不依赖的小任务（write_scopes 互斥、blocked_by 只写真实依赖），再在单轮内 spawn_teammate 并行派成员承接${EXECUTION_TOOLS.has(tool) ? '——执行工具本身就是取证与实现的等价通道' : ''}。实现与取证都必须委派，Lead 只做拆分、派发、合并与校验；本轮派发之后不再重复提醒，新的 turn 开始后会再提醒一次。`
 
 const waitGateReminder = () =>
   '[team-gate] 提醒：连续两次 wait_agent 之间没有任何有效动作，本次等待已放行，但同一 turn 只允许等待一次。先用 list_agents 与 team_task_list 处理已有结果（已结束的队友、completed/ready 任务），或直接推进任务。'
@@ -1133,7 +1116,7 @@ export function apply(ctx, config = {}) {
               }
               const turnEvents = lastTurnStart < 0 ? waitEvents : waitEvents.slice(lastTurnStart + 1)
               // 宿主在 prepare(call.exec) 之前就把本次调用自身的 tool/call 写入 session
-              // （packages/core/agent-loop/src/tool-calls.ts:168→170），不排除就会每次命中自己、全部 deny。
+              // （packages/core/agent-loop/src/tool-calls.ts:168→170），不排除就会每次命中自己、每次都提醒。
               const currentCallId = exec?.callId
               let lastCall
               for (let index = turnEvents.length - 1; index >= 0; index -= 1) {
@@ -1217,13 +1200,14 @@ export function apply(ctx, config = {}) {
       // Lead 门禁：补上成员门禁管不到的另一半——Lead 自己下场取证（bash / pwsh / read / read_image / grep / glob / web_fetch / web_search）、
       // 下场实现（write / edit / apply_patch / str_replace_editor）或下场执行（run_code / terminal_open / terminal_read /
       // terminal_send / terminal_signal），而不是 team_task_create 拆分后 spawn_teammate 交出去。
-      // 只封取证不封动手没有意义：Lead 被拒 bash 后转而 write / edit 就把活做掉了；同理被拒 bash / write 后转而
+      // 只提醒取证不提醒动手没有意义：Lead 被提醒 bash 后转而 write / edit 就把活做掉了；同理转而
       // run_code（程序里读文件写文件跑命令）或 terminal_open（跨 turn 的持久 shell）同样把活做掉了。判定口径：会话已开启命令，且「本轮」
-      // （事件里最后一个 turn/start 之后）既没有委派类 tool/call（spawn_teammate / subagent 系列 / workflow）、
-      // 也没有还在 running 的成员，就直接拒绝该工具；本轮刚 interrupt_agent 中断过成员同样直接拒绝
-      // （成员已不可用，新活必须 spawn 新成员）。单靠 team_task_create 不再放行。
+      // （事件里最后一个 turn/start 之后）没有委派类 tool/call（spawn_teammate / subagent 系列 / workflow），
+      // 就投递一条提醒，工具照常执行。会话里是否还有 running 成员、本轮是否 interrupt_agent 过成员，都不参与判定；
+      // 单靠 team_task_create 不算已派发。
+      // 去重令牌 = 最后一个 turn/start 在事件序列里的下标：同一轮只提醒一次，新的 turn/start 到来 → 令牌变化 → 重新提醒一次。
       // 拿不到判定依据（无 session / 事件读不到 / 找不到 turn/start / 读取抛错）一律 fail-open：
-      // 门禁自身不可靠时放行工具调用，只 warn 一次，避免把宿主卡死或刷屏。
+      // 不提醒、放行工具调用，只 warn 一次，避免把宿主卡死或刷屏。
       if (membership?.role !== 'teammate' && LEAD_BLOCKED_TOOLS.has(tool)) {
         // 子代理（subagent/fork）同样没有 membership，且 fork 会继承父会话事件前缀；用会话头 delegationDepth≥1 排除，避免 Lead 派出的取证 subagent 被自家门禁拦死。
         let depth
@@ -1265,17 +1249,16 @@ export function apply(ctx, config = {}) {
         }
         const thisTurn = events.slice(turnStart + 1)
         let dispatchedAt = -1
-        let interruptedAt = -1
         for (let index = 0; index < thisTurn.length; index += 1) {
           const called = thisTurn[index]?.type === 'tool/call' ? thisTurn[index]?.data?.name : undefined
-          if (DISPATCH_TOOLS.has(called)) dispatchedAt = index
-          else if (called === 'interrupt_agent') interruptedAt = index
+          if (DISPATCH_TOOLS.has(called)) {
+            dispatchedAt = index
+            break
+          }
         }
-        if (interruptedAt >= 0 && interruptedAt > dispatchedAt) {
-          return { kind: 'deny', reason: leadGateDenyReason(tool, '本轮刚 interrupt_agent 中断过成员，成员已不可用，新活必须 spawn 新成员。') }
-        }
-        if (dispatchedAt < 0 && !hasRunningMember(events)) {
-          return { kind: 'deny', reason: leadGateDenyReason(tool, '本轮没有任何 spawn_teammate / subagent 派发，会话里也没有 running 成员。') }
+        if (dispatchedAt < 0) {
+          // 轮次令牌 = 最后一个 turn/start 的下标：同轮只提醒一次，跨轮令牌变化后重新提醒一次。
+          remindOnce(agent, `lead-evidence:${turnStart}`, leadGateReminder(tool))
         }
         return next()
       }

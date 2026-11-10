@@ -1,15 +1,18 @@
 /**
- * task-5 取证旁路补齐：Lead 硬拦集合必须覆盖宿主真实存在的取证工具旁路。
+ * task-5 取证旁路补齐 + task-11 执行旁路：Lead 软提醒集合必须覆盖宿主真实存在的取证 / 实现 / 执行工具旁路。
  * 契约（权威）：
  *   EVIDENCE_TOOLS 除既有 bash / read / grep / glob / web_fetch / web_search 外，新增
  *     read_image —— 宿主真实注册名 packages/fs/tool-fs/src/read-image.ts:211；
  *     pwsh     —— 宿主真实注册名 packages/shell/tool-pwsh/src/index.ts:385；
  *   持久化 pwsh（packages/shell/tool-pwsh-persistent/src/index.ts:428）注册的模型可见工具名同样是 pwsh，
- *   所以一条 pwsh 同时封住前台与持久化两条路，不需要第二个名字。
- *   MCP 工具（模型可见名 mcp__<server>__<tool>）刻意不进硬拦集合（名字由服务器决定，逐名硬拦不可行），
- *   本文件用一条正向用例把这条已知缺口钉住：MCP 命名的工具不会被 Lead 门禁 deny。
- * 判据沿用既有 Lead 门禁：会话已 /using-agent-team 开启，且本轮既无委派类 tool/call、也无 running 成员 → deny；
- * 本轮已派发或有 running 成员 → 放行；header.delegationDepth>=1 的子代理不被自家门禁误伤。
+ *   所以一条 pwsh 同时覆盖前台与持久化两条路，不需要第二个名字。
+ *   MCP 工具（模型可见名 mcp__<server>__<tool>）刻意不进提醒集合（名字由服务器决定，逐名点名不可行），
+ *   本文件用一条正向用例把这条已知缺口钉住：MCP 命名的工具不会被点名提醒。
+ * 判据沿用既有 Lead 门禁（软口径，插件不拒绝任何工具调用）：会话已 /using-agent-team 开启，且本轮
+ * （事件里最后一个 turn/start 之后）无委派类 tool/call → 工具照常放行（next 恰好一次）+ 一条 [team-gate] 提醒；
+ * 本轮已派发 → 放行且不提醒；header.delegationDepth>=1 的子代理不被自家门禁提醒误伤。
+ * 提醒按轮次去重：同一轮只提醒一次，新的 turn/start 到来后重新提醒一次；完整的按轮次证明见
+ * tests/lead-gate-per-turn-reminder.test.js。
  * 运行：node --test tests/
  */
 import test from 'node:test'
@@ -36,7 +39,7 @@ const NEW_BYPASS_TOOLS = ['read_image', 'pwsh']
  */
 const EXECUTION_TOOLS = ['run_code', 'terminal_open', 'terminal_read', 'terminal_send', 'terminal_signal']
 
-/** 终端生命周期簿记工具：宿主存在（:365 / :396）但刻意不入集合，用 B12 把这条边界钉成可验证的契约。 */
+/** 终端生命周期簿记工具：宿主存在（:365 / :396）但刻意不入集合，用 B13 把这条边界钉成可验证的契约。 */
 const TERMINAL_LIFECYCLE_TOOLS = ['terminal_close', 'terminal_list']
 
 const runEvent = (args) => ({ type: 'command/run', data: { name: COMMAND_NAME, args } })
@@ -133,27 +136,30 @@ async function gateOutcome(host, exec) {
   return { nextCalls, decisions, threw }
 }
 
-/** 硬拦判据：不抛异常、恰好一条 deny、next 0 次、reason 点名被拒工具与出路、不投递提醒。 */
-async function assertDenied(host, tool, agent, label) {
+/** 软门禁判据（Lead 命中「本轮未派发」）：不抛异常、恰好一条决策、无 deny、next 恰好一次且返回值来自 next()，并恰好投递一条点名工具与出路的 [team-gate] 提醒；返回提醒正文供调用方核对归类。 */
+async function assertReminded(host, tool, agent, label) {
   const { nextCalls, decisions, threw } = await gateOutcome(host, execOf(tool, agent))
   assert.equal(threw, undefined, `${label} / ${tool}：门禁处理器不得抛异常，实际抛出：${threw instanceof Error ? threw.message : String(threw)}`)
   assert.equal(decisions.length, 1, `${label} / ${tool}：必须恰好一条门禁决策，实际 ${decisions.length} 条`)
-  assert.equal(decisions[0]?.kind, 'deny', `${label} / ${tool}：必须 deny，实际：${JSON.stringify(decisions[0])}`)
-  assert.equal(nextCalls, 0, `${label} / ${tool}：deny 时 next 必须 0 次，实际 ${nextCalls} 次`)
-  const reason = String(decisions[0]?.reason ?? '')
-  assert.match(reason, /^\[team-gate\] LEAD_EVIDENCE_DENIED:/, `${label} / ${tool}：deny 前缀必须是 [team-gate] LEAD_EVIDENCE_DENIED:，实际「${reason}」`)
-  assert.ok(reason.includes(`「${tool}」`), `${label} / ${tool}：reason 必须点名被拒工具，实际「${reason}」`)
-  assert.ok(reason.includes('team_task_create') && reason.includes('spawn_teammate'), `${label} / ${tool}：reason 必须给出唯一出路，实际「${reason}」`)
-  assert.equal(agent?.notices?.length ?? 0, 0, `${label} / ${tool}：硬拦直接拒绝，不得投递提醒，实际 ${agent?.notices?.length ?? 0} 条`)
-  return reason
+  assert.deepEqual(decisions[0], { kind: 'allow', via: 'next' }, `${label} / ${tool}：必须放行且返回值来自 next()，不得 deny，实际：${JSON.stringify(decisions[0])}`)
+  assert.equal(nextCalls, 1, `${label} / ${tool}：放行必须 next 恰好 1 次，实际 ${nextCalls} 次`)
+  const notices = agent?.notices ?? []
+  assert.equal(notices.length, 1, `${label} / ${tool}：必须恰好投递一条 [team-gate] 提醒，实际 ${notices.length} 条`)
+  const reminder = String(notices[0]?.content?.[0]?.text ?? '')
+  assert.match(reminder, /^\[team-gate\] 提醒：/, `${label} / ${tool}：提醒前缀必须是「[team-gate] 提醒：」，实际「${reminder}」`)
+  assert.ok(reminder.includes(`「${tool}」`), `${label} / ${tool}：提醒必须点名被放行的工具，实际「${reminder}」`)
+  assert.ok(reminder.includes('team_task_create') && reminder.includes('spawn_teammate'), `${label} / ${tool}：提醒必须给出出路 team_task_create → spawn_teammate，实际「${reminder}」`)
+  return reminder
 }
 
+/** 放行判据（门禁不命中：本轮已派发 / 子代理 / 开关 off / 不在集合内）：不抛异常、无 deny、next 恰好一次且返回值来自 next()，且不投递任何提醒。 */
 async function assertAllowed(t, host, tool, agent, label) {
   const { nextCalls, decisions, threw } = await gateOutcome(host, execOf(tool, agent))
   assert.equal(threw, undefined, `${label} / ${tool}：门禁处理器不得抛异常，实际抛出：${threw instanceof Error ? threw.message : String(threw)}`)
   assert.equal(decisions.length, 1, `${label} / ${tool}：必须恰好一条决策，实际 ${decisions.length} 条`)
   assert.notEqual(decisions[0]?.kind, 'deny', `${label} / ${tool}：不得 deny，实际：${JSON.stringify(decisions[0])}`)
   assert.equal(nextCalls, 1, `${label} / ${tool}：放行必须 next 恰好 1 次，实际 ${nextCalls} 次`)
+  assert.equal(agent?.notices?.length ?? 0, 0, `${label} / ${tool}：门禁不命中不得投递提醒，实际 ${agent?.notices?.length ?? 0} 条`)
 }
 
 const LEAD_TURN = [runEvent('on'), turnStart(1)]
@@ -166,39 +172,44 @@ test(`契约：apply 注册 ${GATE_EVENT} 处理器（旁路断言的前提）`,
   assert.equal(typeof handlers[0], 'function', '处理器必须是函数')
 })
 
-test(`B1 新增旁路工具逐个硬拦：Lead 本轮无派发无成员时 ${NEW_BYPASS_TOOLS.join(' / ')} 被 deny（next 0 次）`, async (t) => {
+test(`B1 新增旁路工具逐个放行 + 一次提醒：Lead 本轮未派发时 ${NEW_BYPASS_TOOLS.join(' / ')} 照常执行（next 1 次）并收到点名提醒`, async (t) => {
   for (const tool of NEW_BYPASS_TOOLS) {
     await t.test(tool, async () => {
       const host = leadHost()
       apply(host.ctx)
       const agent = leadAgent(LEAD_TURN)
-      const reason = await assertDenied(host, tool, agent, `B1 ${tool}`)
-      assert.match(reason, /取证工具/, `B1 / ${tool}：旁路属于取证类，reason 必须点名「取证工具」，实际「${reason}」`)
-      assert.deepEqual(host.warnings, [], `B1 / ${tool}：硬拦不得产生 fail-open warn，实际：${JSON.stringify(host.warnings)}`)
+      const reminder = await assertReminded(host, tool, agent, `B1 ${tool}`)
+      assert.match(reminder, /取证工具/, `B1 / ${tool}：旁路属于取证类，提醒必须点名「取证工具」，实际「${reminder}」`)
+      assert.deepEqual(host.warnings, [], `B1 / ${tool}：判据成立是正常提醒，不得产生 fail-open warn，实际：${JSON.stringify(host.warnings)}`)
     })
   }
 })
 
-test('B2 同一轮连续两次旁路：两次都 deny（去重只作用于告警，不作用于拦截）', async () => {
+test('B2 同一轮连续三次旁路：三次全部放行，但只提醒一次（去重按轮次令牌，不作用于放行）', async () => {
   const host = leadHost()
   apply(host.ctx)
   const agent = leadAgent(LEAD_TURN)
   for (const tool of ['pwsh', 'read_image', 'pwsh']) {
     const { nextCalls, decisions } = await gateOutcome(host, execOf(tool, agent))
-    assert.equal(decisions[0]?.kind, 'deny', `B2 / ${tool}：必须仍然 deny，实际：${JSON.stringify(decisions[0])}`)
-    assert.equal(nextCalls, 0, `B2 / ${tool}：next 必须 0 次`)
+    assert.deepEqual(decisions[0], { kind: 'allow', via: 'next' }, `B2 / ${tool}：必须放行且返回值来自 next()，不得 deny，实际：${JSON.stringify(decisions[0])}`)
+    assert.equal(nextCalls, 1, `B2 / ${tool}：next 必须恰好 1 次，实际 ${nextCalls} 次`)
   }
+  assert.equal(agent.notices.length, 1, `B2：同一轮只允许一条提醒，实际 ${agent.notices.length} 条`)
+  assert.match(String(agent.notices[0]?.content?.[0]?.text ?? ''), /「pwsh」/, 'B2：提醒必须点名先命中的工具')
 })
 
-test('B3 上一轮的 team_task_create 不算本轮证据：旁路工具仍被拒', async () => {
+test('B3 上一轮的 team_task_create 不算本轮证据：本轮首次旁路仍然提醒，同轮第二次只放行', async () => {
   const host = leadHost()
   apply(host.ctx)
   const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('team_task_create'), turnStart(2)])
-  await assertDenied(host, 'pwsh', agent, 'B3')
-  await assertDenied(host, 'read_image', agent, 'B3')
+  await assertReminded(host, 'pwsh', agent, 'B3')
+  const { nextCalls, decisions } = await gateOutcome(host, execOf('read_image', agent))
+  assert.deepEqual(decisions[0], { kind: 'allow', via: 'next' }, `B3 第二次：必须放行，不得 deny，实际：${JSON.stringify(decisions[0])}`)
+  assert.equal(nextCalls, 1, `B3 第二次：next 必须恰好 1 次，实际 ${nextCalls} 次`)
+  assert.equal(agent.notices.length, 1, `B3：同一轮不得重复提醒，实际 ${agent.notices.length} 条`)
 })
 
-test('B4 本轮已 spawn_teammate 且成员在跑：旁路工具放行（门禁判「本轮是否已派出活」）', async (t) => {
+test('B4 本轮已 spawn_teammate：旁路工具放行且不提醒（门禁判「本轮是否已派出活」）', async (t) => {
   for (const tool of NEW_BYPASS_TOOLS) {
     await t.test(tool, async () => {
       const host = leadHost()
@@ -209,7 +220,7 @@ test('B4 本轮已 spawn_teammate 且成员在跑：旁路工具放行（门禁�
   }
 })
 
-test('B5 Lead 派出的子代理（header.delegationDepth=1）用旁路工具不被自家门禁拦死', async (t) => {
+test('B5 Lead 派出的子代理（header.delegationDepth=1）用旁路工具不被自家门禁提醒误伤', async (t) => {
   for (const tool of NEW_BYPASS_TOOLS) {
     await t.test(tool, async () => {
       const host = leadHost()
@@ -231,7 +242,7 @@ test('B6 未开启 /using-agent-team 的会话：旁路工具放行（插件保�
   }
 })
 
-test('B7 MCP 命名的工具不进硬拦集合（已知未覆盖，靠提示词承担告知）', async (t) => {
+test('B7 MCP 命名的工具不进提醒集合（已知未覆盖，靠提示词承担告知）', async (t) => {
   const MCP_TOOLS = ['mcp__github__get_me', 'mcp__vectr__vectr_search']
   for (const tool of MCP_TOOLS) {
     await t.test(tool, async () => {
@@ -259,43 +270,56 @@ test('B8 成员会话（nested）的 pwsh / read_image 仍走既有成员门禁�
   }
 })
 
-test('B9 实现类旁路没有被顺手放宽：write / edit 与新增取证工具在同一轮同样被拒', async () => {
-  const host = leadHost()
-  apply(host.ctx)
-  const agent = leadAgent(LEAD_TURN)
-  const writeReason = await assertDenied(host, 'write', agent, 'B9')
-  assert.match(writeReason, /实现工具/, 'B9 / write：实现类必须仍点名「实现工具」')
-  const pwshReason = await assertDenied(host, 'pwsh', agent, 'B9')
-  assert.match(pwshReason, /取证工具/, 'B9 / pwsh：取证旁路必须点名「取证工具」')
+test('B9 实现类旁路没有被顺手放宽：write 与新增取证旁路 pwsh 同样命中一次点名提醒', async () => {
+  const writeHost = leadHost()
+  apply(writeHost.ctx)
+  const writeReminder = await assertReminded(writeHost, 'write', leadAgent(LEAD_TURN), 'B9')
+  assert.match(writeReminder, /实现工具/, 'B9 / write：实现类必须仍点名「实现工具」')
+  const pwshHost = leadHost()
+  apply(pwshHost.ctx)
+  const pwshReminder = await assertReminded(pwshHost, 'pwsh', leadAgent(LEAD_TURN), 'B9')
+  assert.match(pwshReminder, /取证工具/, 'B9 / pwsh：取证旁路必须点名「取证工具」')
 })
 
-test(`B10 执行旁路逐个硬拦：Lead 本轮无派发无成员时 ${EXECUTION_TOOLS.join(' / ')} 被 deny（next 0 次，归类「执行工具」）`, async (t) => {
+test(`B10 执行旁路逐个放行 + 一次提醒：Lead 本轮未派发时 ${EXECUTION_TOOLS.join(' / ')} 照常执行（next 1 次，归类「执行工具」）`, async (t) => {
   for (const tool of EXECUTION_TOOLS) {
     await t.test(tool, async () => {
       const host = leadHost()
       apply(host.ctx)
       const agent = leadAgent(LEAD_TURN)
-      const reason = await assertDenied(host, tool, agent, `B10 ${tool}`)
-      assert.match(reason, new RegExp(`^\\[team-gate\\] LEAD_EVIDENCE_DENIED: 执行工具「${tool}」`), `B10 / ${tool}：执行类必须归类为「执行工具」并点名工具名，实际「${reason}」`)
-      assert.match(reason, /执行工具本身就是取证与实现的等价通道/, `B10 / ${tool}：执行类必须说明它是取证与实现的等价通道，实际「${reason}」`)
-      assert.deepEqual(host.warnings, [], `B10 / ${tool}：硬拦不得产生 fail-open warn，实际：${JSON.stringify(host.warnings)}`)
+      const reminder = await assertReminded(host, tool, agent, `B10 ${tool}`)
+      assert.match(reminder, new RegExp(`^\\[team-gate\\] 提醒：.*执行工具「${tool}」`), `B10 / ${tool}：执行类必须归类为「执行工具」并点名工具名，实际「${reminder}」`)
+      assert.match(reminder, /执行工具本身就是取证与实现的等价通道/, `B10 / ${tool}：执行类必须说明它是取证与实现的等价通道，实际「${reminder}」`)
+      assert.deepEqual(host.warnings, [], `B10 / ${tool}：判据成立是正常提醒，不得产生 fail-open warn，实际：${JSON.stringify(host.warnings)}`)
     })
   }
 })
 
-test('B11 执行旁路与实现类共用同一判据：同一轮内 run_code 被拒后转而 write 也照样被拒（不存在「换一个通道就能干活」）', async () => {
-  const host = leadHost()
-  apply(host.ctx)
-  const agent = leadAgent(LEAD_TURN)
-  const runReason = await assertDenied(host, 'run_code', agent, 'B11')
-  assert.match(runReason, /执行工具「run_code」/, `B11 / run_code：必须归类为执行工具，实际「${runReason}」`)
-  const writeReason = await assertDenied(host, 'write', agent, 'B11')
-  assert.match(writeReason, /实现工具「write」/, `B11 / write：必须仍归类为实现工具，实际「${writeReason}」`)
-  const bashReason = await assertDenied(host, 'bash', agent, 'B11')
-  assert.match(bashReason, /取证工具「bash」/, `B11 / bash：取证类归类不得被新集合改写，实际「${bashReason}」`)
+test('B11 执行旁路与实现类共用同一判据：同一轮内先 run_code 后 write / bash 全部放行（不存在「换一个通道就能躲开判据」），且各类在新一轮各自点名归类', async (t) => {
+  await t.test('同一轮内换通道：三次都放行，只提醒一次', async () => {
+    const host = leadHost()
+    apply(host.ctx)
+    const agent = leadAgent(LEAD_TURN)
+    for (const tool of ['run_code', 'write', 'bash']) {
+      const { nextCalls, decisions } = await gateOutcome(host, execOf(tool, agent))
+      assert.deepEqual(decisions[0], { kind: 'allow', via: 'next' }, `B11 同一轮 / ${tool}：必须放行，不得 deny，实际：${JSON.stringify(decisions[0])}`)
+      assert.equal(nextCalls, 1, `B11 同一轮 / ${tool}：next 必须恰好 1 次，实际 ${nextCalls} 次`)
+    }
+    assert.equal(agent.notices.length, 1, `B11 同一轮：换通道不得带来第二条提醒，实际 ${agent.notices.length} 条`)
+    assert.match(String(agent.notices[0]?.content?.[0]?.text ?? ''), /执行工具「run_code」/, `B11 同一轮：先命中的执行工具必须被点名，实际「${agent.notices[0]?.content?.[0]?.text ?? ''}」`)
+  })
+  for (const [tool, category] of [['run_code', '执行工具'], ['write', '实现工具'], ['bash', '取证工具']]) {
+    await t.test(`${tool} 新一轮归类 ${category}`, async () => {
+      const host = leadHost()
+      apply(host.ctx)
+      const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('spawn_teammate'), turnStart(2)])
+      const reminder = await assertReminded(host, tool, agent, `B11 ${tool}`)
+      assert.match(reminder, new RegExp(`${category}「${tool}」`), `B11 / ${tool}：必须归类为「${category}」并点名工具名，实际「${reminder}」`)
+    })
+  }
 })
 
-test('B12 本轮已 spawn_teammate 且成员在跑 / 子代理 delegationDepth=1：执行旁路放行', async (t) => {
+test('B12 本轮已 spawn_teammate / 子代理 delegationDepth=1：执行旁路放行且不提醒', async (t) => {
   for (const tool of EXECUTION_TOOLS) {
     await t.test(`${tool} 本轮已派发`, async () => {
       const host = leadHost()
@@ -311,7 +335,7 @@ test('B12 本轮已 spawn_teammate 且成员在跑 / 子代理 delegationDepth=1
   }
 })
 
-test('B13 刻意的边界：terminal_close / terminal_list 不入集合（自身不执行任何东西，终端只能由已被拦的 terminal_open 建立），与 MCP 命名工具同为已知未覆盖', async (t) => {
+test('B13 刻意的边界：terminal_close / terminal_list 不入集合（自身不执行任何东西，终端只能由已被点名的 terminal_open 建立），与 MCP 命名工具同为已知未覆盖', async (t) => {
   for (const tool of [...TERMINAL_LIFECYCLE_TOOLS, 'mcp__github__get_me']) {
     await t.test(tool, async () => {
       const host = leadHost()

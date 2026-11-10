@@ -1,13 +1,14 @@
 /**
  * task-22 软门禁（放行 + 提醒）与 flat 并行派发提示的专用测试。
  * 断言口径：
- *  - 软门禁（成员侧、wait_agent、已完成成员）：门禁命中后处理器不得返回 { kind:'deny' }，且必须调用 next 恰好一次（工具真的执行了）。
- *  - 硬门禁（Lead 取证工具 bash / pwsh / read / read_image / grep / glob / web_fetch / web_search
- *    + Lead 实现工具 write / edit / apply_patch / str_replace_editor
- *    + Lead 执行工具 run_code / terminal_open / terminal_read / terminal_send / terminal_signal，
+ *  - 软门禁（成员侧、wait_agent、已完成成员，以及 Lead 侧全部点名工具）：门禁命中后处理器不得返回 { kind:'deny' }，且必须调用 next 恰好一次（工具真的执行了）。
+ *  - Lead 点名集合（取证工具 bash / pwsh / read / read_image / grep / glob / web_fetch / web_search
+ *    + 实现工具 write / edit / apply_patch / str_replace_editor
+ *    + 执行工具 run_code / terminal_open / terminal_read / terminal_send / terminal_signal，
  *    task-4 / task-8 / task-11）：
- *    判据命中必须返回 { kind:'deny', reason }（reason 点名被拒工具与唯一出路
- *    team_task_create / spawn_teammate），不得调用 next，也不得投递提醒；Lead 提示词必须预先告知该硬拒。
+ *    判据命中同样只提醒、不拦截——提醒点名工具与出路 team_task_create / spawn_teammate，next 恰好一次；
+ *    同一轮只提醒一次，新的 turn/start 之后重新提醒一次（去重令牌 = 最后一个 turn/start 的下标）。
+ *    Lead 提示词必须预先告知这套「提醒 + 放行」口径。
  *  - 提醒：调用方 Agent 的 inject 恰好收到 1 条 notice（source.form === 'notice'），正文以 [team-gate] 开头、
  *    点名被劝阻的工具，并给出正确做法（委派 / spawn 新成员 / 先登记任务 / 先处理已有结果）。
  *  - 去重：同一会话同一 key 反复命中只投递一次；不同已完成成员各投递一次。
@@ -134,22 +135,27 @@ async function assertRemindedOnce({ tool, host, agent, args, callId }, { label, 
   return { notices }
 }
 
-test('门禁 1 Lead 取证门禁：本轮无派发无成员就 read → 硬拒（deny，不投递提醒）；off 对照放行', async () => {
+test('门禁 1 Lead 取证门禁：本轮无派发就 read → 放行 + 一条点名提醒；同轮再取证不重复提醒，新的 turn/start 后再提醒一次；off 对照放行', async () => {
   const events = [runEvent('on'), turnStart(1)]
   const host = applyGate('flat')
   const agent = agentOf({ id: 'lead-1', events })
   const first = await runGate(host, 'read', agent)
-  assert.equal(first.decisions.filter((d) => d?.kind === 'deny').length, 1, `Lead 无派发无成员取证必须返回一条 deny，实际 ${JSON.stringify(first.decisions)}`)
-  assert.equal(first.nextCalls, 0, `被拒路径不得调用 next（工具不能执行），实际 ${first.nextCalls} 次`)
-  const reason = first.decisions[0]?.reason
-  assert.match(reason, /read/, `deny 理由必须点名被拒工具，实际「${reason}」`)
-  assert.match(reason, /team_task_create/, `deny 理由必须点名唯一出路 team_task_create，实际「${reason}」`)
-  assert.match(reason, /spawn_teammate/, `deny 理由必须点名唯一出路 spawn_teammate，实际「${reason}」`)
-  assert.equal(agent.notices.length, 0, `硬门禁直接拒绝，不得投递提醒，实际 ${agent.notices.length} 条`)
-  // 同一会话再取证一次：判据仍命中，仍然拒绝（去重只适用于软提醒）。
+  assert.equal(first.decisions.filter((d) => d?.kind === 'deny').length, 0, `Lead 无派发取证不得返回 deny，实际 ${JSON.stringify(first.decisions)}`)
+  assert.equal(first.nextCalls, 1, `取证必须放行（next 恰好一次），实际 ${first.nextCalls} 次`)
+  assert.equal(agent.notices.length, 1, `必须投递一条提醒，实际 ${agent.notices.length} 条`)
+  const reminder = noticeText(agent.notices[0])
+  assert.match(reminder, /read/, `提醒必须点名被放行的工具，实际「${reminder}」`)
+  assert.match(reminder, /team_task_create/, `提醒必须点名出路 team_task_create，实际「${reminder}」`)
+  assert.match(reminder, /spawn_teammate/, `提醒必须点名出路 spawn_teammate，实际「${reminder}」`)
+  // 同一轮再取证一次：判据仍命中、同样放行，但轮次令牌已记录 → 不再重复提醒。
   const again = await runGate(host, 'read', agent)
-  assert.equal(again.nextCalls, 0, '第二次取证同样必须被拒')
-  assert.equal(agent.notices.length, 0, `被拒不得累积提醒，实际 ${agent.notices.length} 条`)
+  assert.equal(again.nextCalls, 1, '第二次取证同样放行')
+  assert.equal(agent.notices.length, 1, `同一轮不得重复提醒，实际 ${agent.notices.length} 条`)
+  // 新的 turn/start（新的用户消息）到来：轮次令牌变化 → 再提醒一次。
+  events.push(turnStart(2))
+  const nextTurn = await runGate(host, 'read', agent)
+  assert.equal(nextTurn.nextCalls, 1, '新一轮同样放行')
+  assert.equal(agent.notices.length, 2, `新的 turn/start 后必须重新提醒一次，实际 ${agent.notices.length} 条`)
   // 反例：同一夹具把开关关掉，门禁完全不干预。
   const offHost = applyGate('flat')
   const offAgent = agentOf({ id: 'lead-off', events: [runEvent('on'), turnStart(1), runEvent('off'), turnStart(2)] })
@@ -158,13 +164,14 @@ test('门禁 1 Lead 取证门禁：本轮无派发无成员就 read → 硬拒�
   assert.equal(offAgent.notices.length, 0, `off 后不得投递提醒，实际 ${offAgent.notices.length} 条`)
 })
 
-test('门禁 1b Lead 本轮只有 team_task_create（没有派发、没有 running 成员）：bash 同样被拒', async () => {
+test('门禁 1b Lead 本轮只有 team_task_create（没有派发）：bash 同样只提醒 + 放行（只建看板不算把活派出去）', async () => {
   const host = applyGate('flat')
   const agent = agentOf({ id: 'lead-2', events: [runEvent('on'), turnStart(1), toolCall('team_task_create')] })
   const { decisions, nextCalls, notices } = await runGate(host, 'bash', agent)
-  assert.equal(decisions.filter((d) => d?.kind === 'deny').length, 1, '只建看板不下场派活，取证必须 deny（否则 Lead 建完任务就能自己取证）')
-  assert.equal(nextCalls, 0, `被拒路径不得调用 next，实际 ${nextCalls} 次`)
-  assert.equal(notices.length, 0, `被拒不得投递提醒，实际 ${notices.length} 条`)
+  assert.equal(decisions.filter((d) => d?.kind === 'deny').length, 0, `只建看板不下场派活，取证不得 deny，实际 ${JSON.stringify(decisions)}`)
+  assert.equal(nextCalls, 1, `必须放行（next 恰好一次），实际 ${nextCalls} 次`)
+  assert.equal(notices.length, 1, `必须投递一条提醒，实际 ${notices.length} 条`)
+  assert.match(noticeText(notices[0]), /「bash」/, `提醒必须点名工具 bash，实际「${noticeText(notices[0])}」`)
 })
 
 test('门禁 2 flat 成员派子代理：放行 + 只提醒一次（点名 flat 模式与自己执行）', async () => {
@@ -282,29 +289,35 @@ test('flat 模式提示词：Lead 段与成员段都要求「拆小任务 + 单�
   assert.doesNotMatch(nestedText, /flat 模式/, 'nested 成员段不得出现 flat 口径')
 })
 
-test('门禁口径：Lead 段必须预先告知「取证 + 实现 + 执行」会被硬拒，成员段仍是「放行 + 提醒」', () => {
+test('门禁口径：Lead 段必须预先告知「取证 + 实现 + 执行」会收到按轮次刷新的提醒并照常执行，成员段同为「放行 + 提醒」', () => {
   const host = createHost({ agentTeams: { tryMembership: (agent) => agent?.membership ?? undefined } })
   apply(host.ctx, { mode: 'flat' })
   const leadText = sectionText(host, agentOf({ id: 'wording-lead', events: [runEvent('on')] }))
   const memberText = sectionText(host, agentOf({ id: 'wording-member', events: [], membership: membershipOf({ rootEvents: [runEvent('on')] }) }))
-  // Lead 段：硬拦工具与 deny 前缀必须写进提示词，不能只靠被拒后才知道。
+  // Lead 段：点名工具集合与「提醒 + 放行」口径必须写进提示词，不能只靠被提醒后才知道。
   const LEAD_BLOCKED_TOOLS = ['bash', 'pwsh', 'read', 'read_image', 'grep', 'glob', 'web_fetch', 'web_search', 'write', 'edit', 'apply_patch', 'str_replace_editor', 'run_code', 'terminal_open', 'terminal_read', 'terminal_send', 'terminal_signal']
   for (const tool of LEAD_BLOCKED_TOOLS) {
-    assert.ok(leadText.includes(tool), `Lead 段必须点名会被硬拒的工具「${tool}」，实际提示词：${leadText}`)
+    assert.ok(leadText.includes(tool), `Lead 段必须点名会被提醒的工具「${tool}」，实际提示词：${leadText}`)
   }
-  assert.match(leadText, /\[team-gate\] LEAD_EVIDENCE_DENIED:/, `Lead 段必须给出 deny 前缀 [team-gate] LEAD_EVIDENCE_DENIED:，实际：${leadText}`)
-  assert.match(leadText, /会被直接拒绝|会被硬拒/, `Lead 段必须说明这些工具会被硬拒（不是「放行 + 提醒」），实际：${leadText}`)
-  assert.match(leadText, /team_task_create[\s\S]*spawn_teammate/, `Lead 段必须给出唯一出路 team_task_create → 单轮内并行 spawn_teammate，实际：${leadText}`)
-  // 反例（断言不是恒真）：成员侧仍是软门禁，成员段不得宣称硬拒绝。
+  assert.match(leadText, /\[team-gate\]/, `Lead 段必须给出提醒前缀 [team-gate]，实际：${leadText}`)
+  assert.match(leadText, /提醒/, `Lead 段必须说明这些工具会收到提醒，实际：${leadText}`)
+  assert.match(leadText, /工具照常执行/, `Lead 段必须说明工具照常执行（不是拒绝），实际：${leadText}`)
+  assert.match(leadText, /每轮/, `Lead 段必须说明提醒按轮次生效，实际：${leadText}`)
+  assert.match(leadText, /新一轮[\s\S]*再提醒一次/, `Lead 段必须说明新的用户消息开新一轮后会再提醒一次，实际：${leadText}`)
+  assert.match(leadText, /team_task_create[\s\S]*spawn_teammate/, `Lead 段必须给出出路 team_task_create → 单轮内并行 spawn_teammate，实际：${leadText}`)
+  // 反例（断言不是恒真）：Lead 段与成员段都不得宣称硬拒绝。
+  assert.doesNotMatch(leadText, /LEAD_EVIDENCE_DENIED|已被门禁拒绝|会被拒绝|会被硬拒|已被门禁拦/, `Lead 段不得宣称硬拒绝，实际：${leadText}`)
   assert.doesNotMatch(memberText, /已被门禁拒绝|会被拒绝|已被门禁拦/, `成员段不得宣称硬拒绝，实际：${memberText}`)
   for (const [name, text] of [['Lead 段', leadText], ['成员段', memberText]]) {
-    assert.match(text, /放行但立即提醒|放行并投递|仍会成功/, `${name}必须说明「放行 + 提醒」的软门禁口径`)
+    assert.match(text, /放行但立即提醒|放行并投递|仍会成功|工具照常执行/, `${name}必须说明「放行 + 提醒」的软门禁口径`)
   }
-  // 硬拦不随模式变松：nested 的 Lead 段同样预先告知。
+  // 口径不随模式变松：nested 的 Lead 段同样预先告知「提醒 + 放行」。
   const nestedLeadHost = createHost({ agentTeams: { tryMembership: (agent) => agent?.membership ?? undefined } })
   apply(nestedLeadHost.ctx, { mode: 'nested' })
   const nestedLeadText = sectionText(nestedLeadHost, agentOf({ id: 'wording-nested-lead', events: [runEvent('on')] }))
-  assert.match(nestedLeadText, /\[team-gate\] LEAD_EVIDENCE_DENIED:/, `nested Lead 段必须同样预先告知硬拒，实际：${nestedLeadText}`)
+  assert.match(nestedLeadText, /\[team-gate\]/, `nested Lead 段必须同样给出提醒前缀 [team-gate]，实际：${nestedLeadText}`)
+  assert.match(nestedLeadText, /工具照常执行/, `nested Lead 段必须同样说明工具照常执行，实际：${nestedLeadText}`)
+  assert.doesNotMatch(nestedLeadText, /LEAD_EVIDENCE_DENIED|会被硬拒|会被拒绝|已被门禁拦/, `nested Lead 段不得宣称硬拒绝，实际：${nestedLeadText}`)
   for (const tool of ['write', 'edit', 'apply_patch', 'str_replace_editor', 'run_code', 'terminal_open', 'terminal_read', 'terminal_send', 'terminal_signal']) {
     assert.ok(nestedLeadText.includes(tool), `nested Lead 段必须点名实现 / 执行工具「${tool}」，实际：${nestedLeadText}`)
   }

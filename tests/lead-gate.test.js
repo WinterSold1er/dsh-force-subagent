@@ -11,26 +11,29 @@
  *     （宿主真实注册名：packages/core/tool-executor-ptc/src/ptc.ts:298 + packages/core/tools/src/contracts.ts:12、
  *      packages/experimental/tool-terminal/src/index.ts:166 / :203 / :307 / :340；terminal_close / terminal_list
  *      是终端生命周期簿记、不在集合内，理由见 index.js 注释）；
- *   Lead 硬拦集合 = 三类并集（取证 8 + 实现 4 + 执行 5 = 17），同一判据；
- *   拒绝条件 = Lead 会话（ctx.get('agentTeams').tryMembership(exec.agent) 未命中）
+ *   Lead 提醒触发集合 = 三类并集（取证 8 + 实现 4 + 执行 5 = 17），同一判据；
+ *   提醒条件 = Lead 会话（ctx.get('agentTeams').tryMembership(exec.agent) 未命中）
  *     + force-subagent 启用（Lead 会话最后一次 command/run（using-agent-team）args 非 off）
  *     + 被调工具 ∈ 三类并集
- *     + 本 turn（事件序列中最后一个 turn/start 之后）既没有委派类 tool/call（spawn_teammate / subagent 系列 / workflow），
- *       也没有 running 成员（team/member 最后快照 phase !== 'failed' 且未被 finishedMembers 判定完成）；
- *     + 或本 turn 的 interrupt_agent 发生在最后一次委派之后 → 同样拒绝（成员已不可用）；
+ *     + 本 turn（事件序列中最后一个 turn/start 之后）没有委派类 tool/call（spawn_teammate / subagent 系列 / workflow）
+ *     → 经 agent.inject 投递一条 [team-gate] 提醒，随后 return next() 放行；插件不返回任何拒绝结果。
+ *   去重粒度 = 轮次：提醒 key = lead-evidence:${最后一个 turn/start 的下标}，同轮只提醒一次，
+ *     新的 turn/start 到来（Lead 收到新消息）后重新提醒一次；
+ *   会话是否还有 running 成员、本轮是否 interrupt_agent 过成员都不参与判定（hasRunningMember 与 interrupt_agent 判据已移除）；
  *   编排类工具（team_task_* / spawn_teammate / send_message / wait_agent / list_agents / interrupt_agent）不受影响；
- *   单靠 team_task_create 不再放行取证工具；
+ *   单靠 team_task_create 不算已派发（仍提醒一次）；
  *   其余全部放行（返回值必须是 next() 的结果）；成员会话（tryMembership 命中）继续走既有成员门禁分支；
- *   fail-open：读取会话事件（snapshotEvents）抛错 → 放行且不抛异常。
- * 断言口径：每条用例都核对 next 是否被调用与调用次数；硬门禁用例核对 deny 返回值与 reason 正文
- *   （必须点名被拒工具名与唯一出路 team_task_create / spawn_teammate）且不投递提醒；放行用例核对
- *   next 恰好一次且返回值来自 next()。
+ *   fail-open：读取会话事件（snapshotEvents）抛错 → 放行、不提醒、不抛异常。
+ * 断言口径：每条用例都核对 next 是否被调用与调用次数；提醒用例核对恰好一条提醒
+ *   （点名工具名与 team_task_create / spawn_teammate 出路）+ next 恰好一次 + 无 deny；放行用例核对
+ *   next 恰好一次、返回值来自 next() 且不投递提醒。
  * 构造方式与 tests/member-gate-deny.test.js、tests/member-gate-allow.test.js、tests/gate-observability.test.js 一致：
  *   真实 apply(ctx) 登记的 tools/pre-execute 处理器，不 mock 处理器自身。
  * 运行：node --test tests/lead-gate.test.js
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 
 import * as plugin from '../index.js'
 
@@ -236,33 +239,6 @@ async function assertReminded(t, host, tool, agent, label, hint = /team_task_cre
   assert.match(text, hint, `${label} / ${tool}：提醒必须命中「${hint}」，实际为「${text}」`)
 }
 
-/** Lead 取证硬门禁判据：不抛异常、恰好一条 deny、next 未被调用、reason 点名被拒工具与唯一出路，且不投递提醒。 */
-async function assertDenied(t, host, tool, agent, label, hint = /team_task_create[\s\S]*spawn_teammate/) {
-  const handlers = noHandlerDiagnostic(t, host, label, tool)
-  assert.ok(
-    handlers.length >= 1,
-    `${label} / ${tool}：apply 未注册 ${GATE_EVENT} 处理器，「拒绝」无从验证；实际监听：[${host.onCalls.map(([event]) => String(event)).join(', ') || '无'}]`,
-  )
-
-  const { decisions, threw, nextCalls } = await gateOutcome(host, execOf(tool, agent))
-  assert.equal(
-    threw,
-    undefined,
-    `${label} / ${tool}：门禁处理器不得抛异常，实际抛出：${threw instanceof Error ? threw.message : String(threw)}`,
-  )
-  const denials = decisions.filter((decision) => decision?.kind === 'deny')
-  assert.equal(denials.length, 1, `${label} / ${tool}：必须恰好返回一条 deny，实际 ${stringify(decisions)}`)
-  assert.equal(nextCalls, 0, `${label} / ${tool}：被拒路径不得调用 next（工具不能真的执行），实际 ${nextCalls} 次`)
-  const reason = denials[0]?.reason
-  assert.equal(typeof reason, 'string', `${label} / ${tool}：deny 必须给出字符串 reason，实际 ${stringify(denials[0])}`)
-  assert.ok(reason.length > 0, `${label} / ${tool}：reason 不得为空串`)
-  assert.match(reason, new RegExp(tool), `${label} / ${tool}：reason 必须点名被拒工具名「${tool}」，实际为「${reason}」`)
-  assert.match(reason, hint, `${label} / ${tool}：reason 必须给出唯一出路（命中「${hint}」），实际为「${reason}」`)
-  assert.equal(agent?.notices?.length ?? 0, 0, `${label} / ${tool}：硬门禁不再投递提醒，实际 ${agent?.notices?.length ?? 0} 条`)
-  const failOpen = host.warnings.filter((message) => /门禁未生效|放行/.test(message))
-  assert.equal(failOpen.length, 0, `${label} / ${tool}：判据成立而工具被拒，不属于 fail-open，不得 warn，实际：${host.warnings.join(' | ')}`)
-}
-
 test(`契约：apply 注册 ${GATE_EVENT} 处理器（Lead 门禁断言的前提）`, (t) => {
   const host = leadHost()
   apply(host.ctx)
@@ -276,27 +252,27 @@ test(`契约：apply 注册 ${GATE_EVENT} 处理器（Lead 门禁断言的前提
   }
 })
 
-test('L1 启用 + Lead + 本轮无派发无成员：bash 被拒（reason 点名 bash 与 team_task_create / spawn_teammate）', async (t) => {
+test('L1 启用 + Lead + 本轮无派发：bash 放行并提醒一次（提醒点名 bash 与 team_task_create / spawn_teammate）', async (t) => {
   const host = leadHost()
   apply(host.ctx)
   const agent = leadAgent([runEvent('on'), turnStart(1)])
-  await assertDenied(t, host, 'bash', agent, 'L1 Lead 已启用且本轮无派发无成员')
+  await assertReminded(t, host, 'bash', agent, 'L1 Lead 已启用且本轮无派发', /team_task_create[\s\S]*spawn_teammate/)
 })
 
-test('L2 启用 + Lead + 本轮只有 team_task_create（没有派发、没有 running 成员）：bash 被拒', async (t) => {
+test('L2 启用 + Lead + 本轮只有 team_task_create（没有派发）：bash 放行并提醒一次（单靠看板不算已派活）', async (t) => {
   const host = leadHost()
   apply(host.ctx)
   const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('team_task_create'), toolCall('team_task_get')])
-  await assertDenied(t, host, 'bash', agent, 'L2 Lead 只建了看板就下场取证')
+  await assertReminded(t, host, 'bash', agent, 'L2 Lead 只建了看板就下场取证', /team_task_create[\s\S]*spawn_teammate/)
 })
 
-test('L3 EVIDENCE_TOOLS 全表同规则：Lead 本轮无派发无成员时逐个被拒', async (t) => {
+test('L3 EVIDENCE_TOOLS 全表同规则：Lead 本轮无派发时逐个放行 + 提醒一次', async (t) => {
   for (const tool of EVIDENCE_TOOLS) {
     await t.test(tool, async () => {
       const host = leadHost()
       apply(host.ctx)
       const agent = leadAgent([runEvent('on'), turnStart(1)])
-      await assertDenied(t, host, tool, agent, `L3 Lead 已启用且本轮无派发无成员（${tool}）`)
+      await assertReminded(t, host, tool, agent, `L3 Lead 已启用且本轮无派发（${tool}）`, /team_task_create[\s\S]*spawn_teammate/)
     })
   }
 })
@@ -356,7 +332,7 @@ test('L6 成员会话（tryMembership 命中）仍走既有成员门禁分支：
   }
 })
 
-test('L7 turn 边界：上一 turn 的 team_task_create 不算本轮证据，仍拒绝', async (t) => {
+test('L7 turn 边界：上一 turn 的 team_task_create 不算本轮证据，本轮仍然提醒', async (t) => {
   const CASES = [
     {
       label: 'create 在前一 turn，随后 turn/start 开新 turn',
@@ -371,7 +347,7 @@ test('L7 turn 边界：上一 turn 的 team_task_create 不算本轮证据，仍
     await t.test(label, async () => {
       const host = leadHost()
       apply(host.ctx)
-      await assertDenied(t, host, 'bash', leadAgent(events), `L7 ${label}`)
+      await assertReminded(t, host, 'bash', leadAgent(events), `L7 ${label}`, /team_task_create[\s\S]*spawn_teammate/)
     })
   }
 })
@@ -418,13 +394,13 @@ test('L10 subagent 会话头 delegationDepth=1：取证 read 不被 Lead 门禁�
   await assertAllowed(t, host, 'read', subAgentWithHeader(1), 'L10 subagent header.delegationDepth=1')
 })
 
-test('L10b 反向对照：同一 fixture header.delegationDepth=0（Lead）→ read 被拒（deny，不投递提醒）', async (t) => {
+test('L10b 反向对照：同一 fixture header.delegationDepth=0（Lead）→ read 放行并提醒一次', async (t) => {
   const host = leadHost()
   apply(host.ctx)
-  await assertDenied(t, host, 'read', subAgentWithHeader(0), 'L10b Lead 会话头 delegationDepth=0')
+  await assertReminded(t, host, 'read', subAgentWithHeader(0), 'L10b Lead 会话头 delegationDepth=0', /team_task_create[\s\S]*spawn_teammate/)
 })
 
-test('L10c 会话头缺失按 delegationDepth=0 处理（根会话）→ read 被拒', async (t) => {
+test('L10c 会话头缺失按 delegationDepth=0 处理（根会话）→ read 放行并提醒一次', async (t) => {
   const host = leadHost()
   apply(host.ctx)
   const agent = {
@@ -433,7 +409,7 @@ test('L10c 会话头缺失按 delegationDepth=0 处理（根会话）→ read �
     notices: [],
     inject(message) { this.notices.push(message) },
   }
-  await assertDenied(t, host, 'read', agent, 'L10c header 缺失按 depth=0 拒绝')
+  await assertReminded(t, host, 'read', agent, 'L10c header 缺失按 depth=0 提醒', /team_task_create[\s\S]*spawn_teammate/)
 })
 
 test('L10d 会话头 getter 抛错：fail-open 放行且 warn 恰好 1 次', async (t) => {
@@ -455,25 +431,25 @@ test('L10d 会话头 getter 抛错：fail-open 放行且 warn 恰好 1 次', asy
   assert.match(host.warnings[0], /放行|门禁未生效/, 'L10d：warn 必须点名放行后果')
 })
 
-test('L11 本轮既没有派发也没有 running 成员：取证工具逐个被拒（含 web_fetch / web_search）', async (t) => {
+test('L11 本轮没有派发：取证工具逐个放行 + 提醒一次（含 web_fetch / web_search）', async (t) => {
   for (const tool of EVIDENCE_TOOLS) {
     await t.test(tool, async () => {
       const host = leadHost()
       apply(host.ctx)
       const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('team_task_create'), toolCall('team_task_list')])
-      await assertDenied(t, host, tool, agent, `L11 无派发无成员（${tool}）`)
+      await assertReminded(t, host, tool, agent, `L11 无派发（${tool}）`, /team_task_create[\s\S]*spawn_teammate/)
     })
   }
 })
 
-test('L12 本轮已 spawn_teammate 且成员在跑：Lead 取证放行（next 恰好 1 次、无提醒）', async (t) => {
+test('L12 本轮已 spawn_teammate：Lead 取证放行且不提醒（判据只看本轮是否已派发）', async (t) => {
   const host = leadHost()
   apply(host.ctx)
   const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('team_task_create'), toolCall('spawn_teammate'), memberEvent('m1')])
   await assertAllowed(t, host, 'bash', agent, 'L12 本轮已派发且有 running 成员')
 })
 
-test('L13 本轮 interrupt_agent 中断成员后立即取证：被拒（reason 点名 interrupt_agent 与新成员出路）', async (t) => {
+test('L13 interrupt_agent 不参与判定：本轮已派发后中断成员再取证，放行且不提醒', async (t) => {
   const host = leadHost()
   apply(host.ctx)
   const agent = leadAgent([
@@ -485,18 +461,20 @@ test('L13 本轮 interrupt_agent 中断成员后立即取证：被拒（reason �
     taskEvent('t1', 'in_progress', 'm1'),
     toolCall('interrupt_agent'),
   ])
-  await assertDenied(t, host, 'grep', agent, 'L13 中断成员后立刻取证')
-  const gate = await gateOutcome(host, execOf('grep', leadAgent([
+  await assertAllowed(t, host, 'grep', agent, 'L13 中断成员后立刻取证（本轮已派发）')
+  // 反例（断言不是恒真）：同一夹具把本轮的 spawn_teammate 去掉 → 判据成立 → 放行 + 提醒一次，而不是拒绝。
+  const bareAgent = leadAgent([
     runEvent('on'),
     turnStart(1),
-    toolCall('spawn_teammate'),
+    toolCall('team_task_create'),
     memberEvent('m1'),
     toolCall('interrupt_agent'),
-  ])))
-  const deny = gate.decisions.find((decision) => decision?.kind === 'deny')
-  assert.ok(deny, 'L13：必须返回 deny')
-  assert.match(deny.reason, /interrupt_agent/, 'L13：reason 必须点名本轮 interrupt_agent')
-  assert.match(deny.reason, /新活必须 spawn 新成员/, 'L13：reason 必须给出唯一出路（新成员承接）')
+  ])
+  const bare = await gateOutcome(host, execOf('grep', bareAgent))
+  assert.equal(bare.threw, undefined, `L13 无派发对照：门禁处理器不得抛异常，实际抛出：${bare.threw instanceof Error ? bare.threw.message : String(bare.threw)}`)
+  assert.equal(bare.nextCalls, 1, `L13 无派发对照：必须放行（next 恰好一次），实际 ${bare.nextCalls} 次`)
+  assert.equal(bare.decisions.filter((decision) => decision?.kind === 'deny').length, 0, `L13 无派发对照：不得 deny，实际 ${stringify(bare.decisions)}`)
+  assert.equal(bareAgent.notices.length, 1, `L13 无派发对照：必须恰好投递一条提醒，实际 ${bareAgent.notices.length} 条`)
 })
 
 test('L14 中断成员后重新 spawn 派发：同一轮立即恢复放行（不得永久锁死）', async (t) => {
@@ -514,33 +492,31 @@ test('L14 中断成员后重新 spawn 派发：同一轮立即恢复放行（不
   await assertAllowed(t, host, 'bash', agent, 'L14 中断后重新派发')
 })
 
-test('L15 running 成员判据：active 且名下有在办任务 → 放行；failed / 任务全部 completed → 不算 running', async (t) => {
+test('L15 running 成员判据已移除：成员 active / failed / 任务全部 completed 都不参与判定（本轮未派发一律提醒一次，本轮已派发一律不提醒）', async (t) => {
   const CASES = [
     {
       label: '上一 turn spawn 的 active 成员仍有 in_progress 任务',
       events: [runEvent('on'), turnStart(1), memberEvent('m1'), taskEvent('t1', 'in_progress', 'm1'), turnStart(2)],
-      expected: 'allow',
     },
     {
       label: '成员 phase=failed（硬终态）',
       events: [runEvent('on'), turnStart(1), memberEvent('m1', 'failed'), turnStart(2)],
-      expected: 'deny',
     },
     {
       label: '成员 active 但名下任务全部 completed（finishedMembers 判定已完成）',
       events: [runEvent('on'), turnStart(1), memberEvent('m1'), taskEvent('t1', 'completed', 'm1'), turnStart(2)],
-      expected: 'deny',
     },
   ]
-  for (const { label, events, expected } of CASES) {
-    await t.test(label, async () => {
+  for (const { label, events } of CASES) {
+    await t.test(`${label}（本轮未派发）`, async () => {
       const host = leadHost()
       apply(host.ctx)
-      if (expected === 'allow') {
-        await assertAllowed(t, host, 'read', leadAgent(events), `L15 ${label}`)
-      } else {
-        await assertDenied(t, host, 'read', leadAgent(events), `L15 ${label}`)
-      }
+      await assertReminded(t, host, 'read', leadAgent(events), `L15 ${label} 未派发`, /team_task_create[\s\S]*spawn_teammate/)
+    })
+    await t.test(`${label}（本轮已派发）`, async () => {
+      const host = leadHost()
+      apply(host.ctx)
+      await assertAllowed(t, host, 'read', leadAgent([...events, toolCall('spawn_teammate')]), `L15 ${label} 已派发`)
     })
   }
 })
@@ -556,41 +532,43 @@ test('L16 nested 模式 Lead 直派 subagent / workflow 也算已派发：取证
   }
 })
 
-test('L17 本轮既没有派发也没有 running 成员：实现工具逐个被拒（write / edit / apply_patch / str_replace_editor）', async (t) => {
-  // 封的就是「Lead 被拒 bash 之后转而自己写文件」这条绕行：判据与取证类完全一致。
+test('L17 本轮没有派发：实现工具逐个放行 + 提醒一次（write / edit / apply_patch / str_replace_editor）', async (t) => {
+  // 覆盖的就是「Lead 被提醒 bash 之后转而自己写文件」这条绕行：判据与取证类完全一致。
   for (const tool of IMPLEMENTATION_TOOLS) {
     await t.test(tool, async () => {
       const host = leadHost()
       apply(host.ctx)
       const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('team_task_create')])
-      await assertDenied(t, host, tool, agent, `L17 Lead 只建了看板就下场写文件（${tool}）`)
+      await assertReminded(t, host, tool, agent, `L17 Lead 只建了看板就下场写文件（${tool}）`, /team_task_create[\s\S]*spawn_teammate/)
     })
   }
 })
 
-test('L18 实现工具的 deny 正文：前缀 [team-gate] LEAD_EVIDENCE_DENIED:、点名「实现工具「write」」与「实现与取证都必须委派」', async (t) => {
+test('L18 实现工具的提醒正文：前缀 [team-gate] 提醒、点名「实现工具「write」」与「实现与取证都必须委派」，工具照常执行', async (t) => {
   const host = leadHost()
   apply(host.ctx)
   const agent = leadAgent([runEvent('on'), turnStart(1)])
   const { decisions, threw, nextCalls } = await gateOutcome(host, execOf('write', agent))
   assert.equal(threw, undefined, `L18 / write：门禁处理器不得抛异常，实际抛出：${threw instanceof Error ? threw.message : String(threw)}`)
-  const denials = decisions.filter((decision) => decision?.kind === 'deny')
-  assert.equal(denials.length, 1, `L18 / write：必须恰好一条 deny，实际 ${stringify(decisions)}`)
-  assert.equal(nextCalls, 0, `L18 / write：硬拒路径不得调用 next（工具不得真正执行），实际 ${nextCalls} 次`)
-  const reason = denials[0]?.reason
-  assert.equal(typeof reason, 'string', `L18 / write：deny 必须给出字符串 reason，实际 ${stringify(denials[0])}`)
-  assert.match(reason, /^\[team-gate\] LEAD_EVIDENCE_DENIED:/, `L18 / write：reason 前缀必须是 [team-gate] LEAD_EVIDENCE_DENIED:，实际「${reason}」`)
-  assert.match(reason, /实现工具「write」/, `L18 / write：reason 必须把它归为实现工具，实际「${reason}」`)
-  assert.match(reason, /实现与取证都必须委派/, `L18 / write：reason 必须说明实现与取证都必须委派，实际「${reason}」`)
-  assert.match(reason, /team_task_create[\s\S]*spawn_teammate/, `L18 / write：reason 必须给出唯一出路，实际「${reason}」`)
-  assert.equal(agent.notices.length, 0, `L18 / write：硬拒不得同时投递提醒，实际 ${agent.notices.length} 条`)
+  assert.equal(decisions.filter((decision) => decision?.kind === 'deny').length, 0, `L18 / write：不得返回任何 deny，实际 ${stringify(decisions)}`)
+  assert.equal(nextCalls, 1, `L18 / write：提醒路径必须调用 next（工具真正执行），实际 ${nextCalls} 次`)
+  assert.equal(agent.notices.length, 1, `L18 / write：必须恰好投递一条提醒，实际 ${agent.notices.length} 条`)
+  const text = agent.notices[0]?.content?.[0]?.text
+  assert.match(text, /^\[team-gate\] 提醒：/, `L18 / write：提醒前缀必须是 [team-gate] 提醒：，实际「${text}」`)
+  assert.match(text, /本轮还没有派发成员/, `L18 / write：必须说明本轮尚未派发，实际「${text}」`)
+  assert.match(text, /实现工具「write」/, `L18 / write：必须把它归为实现工具并点名工具名，实际「${text}」`)
+  assert.match(text, /仍会照常执行/, `L18 / write：必须说明工具照常执行，实际「${text}」`)
+  assert.match(text, /实现与取证都必须委派/, `L18 / write：必须说明实现与取证都必须委派，实际「${text}」`)
+  assert.match(text, /team_task_create[\s\S]*spawn_teammate/, `L18 / write：必须给出正确做法，实际「${text}」`)
+  assert.match(text, /新的 turn 开始后会再提醒一次/, `L18 / write：必须说明按轮刷新，实际「${text}」`)
+  assert.deepEqual(host.warnings, [], `L18 / write：提醒投递不属于 fail-open，不得 warn，实际：${JSON.stringify(host.warnings)}`)
 })
 
-test('L19 本轮已 spawn_teammate 且有 running 成员：Lead 的 write 放行（门禁判「本轮是否已派出活」，不是一律封写）', async (t) => {
+test('L19 本轮已 spawn_teammate：Lead 的 write 放行且不提醒（门禁判「本轮是否已派出活」，不是一律封写）', async (t) => {
   const host = leadHost()
   apply(host.ctx)
   const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('team_task_create'), toolCall('spawn_teammate'), memberEvent('m1')])
-  await assertAllowed(t, host, 'write', agent, 'L19 本轮已派发且有 running 成员')
+  await assertAllowed(t, host, 'write', agent, 'L19 本轮已派发')
 })
 
 test('L20 Lead 派出的子代理（header.delegationDepth=1）实现工具放行：委派后的实现必须真能落地', async (t) => {
@@ -613,19 +591,19 @@ test('L21 成员会话（nested）的实现工具不被 Lead 集合卷入拒绝�
   }
 })
 
-test('L22 本轮既没有派发也没有 running 成员：执行类工具逐个被拒（run_code / terminal_open / terminal_read / terminal_send / terminal_signal）', async (t) => {
-  // 封的就是「Lead 被拒 bash / write 之后改用 run_code 或持久终端把活做掉」这条绕行：判据与取证类、实现类完全一致。
+test('L22 本轮没有派发：执行类工具逐个放行 + 提醒一次（run_code / terminal_open / terminal_read / terminal_send / terminal_signal）', async (t) => {
+  // 覆盖的就是「Lead 被提醒 bash / write 之后改用 run_code 或持久终端把活做掉」这条绕行：判据与取证类、实现类完全一致。
   for (const tool of EXECUTION_TOOLS) {
     await t.test(tool, async () => {
       const host = leadHost()
       apply(host.ctx)
       const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('team_task_create')])
-      await assertDenied(t, host, tool, agent, `L22 Lead 只建了看板就下场执行（${tool}）`)
+      await assertReminded(t, host, tool, agent, `L22 Lead 只建了看板就下场执行（${tool}）`, /team_task_create[\s\S]*spawn_teammate/)
     })
   }
 })
 
-test('L23 执行类工具的 deny 正文：前缀 [team-gate] LEAD_EVIDENCE_DENIED:、逐个点名「执行工具「<tool>」」与「实现与取证都必须委派」', async (t) => {
+test('L23 执行类工具的提醒正文：前缀 [team-gate] 提醒、逐个点名「执行工具「<tool>」」与等价通道说明', async (t) => {
   for (const tool of EXECUTION_TOOLS) {
     await t.test(tool, async () => {
       const host = leadHost()
@@ -633,28 +611,25 @@ test('L23 执行类工具的 deny 正文：前缀 [team-gate] LEAD_EVIDENCE_DENI
       const agent = leadAgent([runEvent('on'), turnStart(1)])
       const { decisions, threw, nextCalls } = await gateOutcome(host, execOf(tool, agent))
       assert.equal(threw, undefined, `L23 / ${tool}：门禁处理器不得抛异常，实际抛出：${threw instanceof Error ? threw.message : String(threw)}`)
-      const denials = decisions.filter((decision) => decision?.kind === 'deny')
-      assert.equal(denials.length, 1, `L23 / ${tool}：必须恰好一条 deny，实际 ${stringify(decisions)}`)
-      assert.equal(nextCalls, 0, `L23 / ${tool}：硬拒路径不得调用 next（工具不得真正执行），实际 ${nextCalls} 次`)
-      const reason = denials[0]?.reason
-      assert.equal(typeof reason, 'string', `L23 / ${tool}：deny 必须给出字符串 reason，实际 ${stringify(denials[0])}`)
-      assert.match(reason, /^\[team-gate\] LEAD_EVIDENCE_DENIED:/, `L23 / ${tool}：reason 前缀必须是 [team-gate] LEAD_EVIDENCE_DENIED:，实际「${reason}」`)
-      assert.match(reason, new RegExp(`执行工具「${tool}」`), `L23 / ${tool}：reason 必须把它归为执行工具并点名工具名，实际「${reason}」`)
-      assert.match(reason, /实现与取证都必须委派/, `L23 / ${tool}：reason 必须说明实现与取证都必须委派，实际「${reason}」`)
-      assert.match(reason, /team_task_create[\s\S]*spawn_teammate/, `L23 / ${tool}：reason 必须给出唯一出路，实际「${reason}」`)
-      assert.equal(agent.notices.length, 0, `L23 / ${tool}：硬拒不得同时投递提醒，实际 ${agent.notices.length} 条`)
-      assert.deepEqual(host.warnings, [], `L23 / ${tool}：判据成立而工具被拒不属于 fail-open，不得 warn，实际：${JSON.stringify(host.warnings)}`)
+      assert.equal(decisions.filter((decision) => decision?.kind === 'deny').length, 0, `L23 / ${tool}：不得返回任何 deny，实际 ${stringify(decisions)}`)
+      assert.equal(nextCalls, 1, `L23 / ${tool}：提醒路径必须调用 next（工具真正执行），实际 ${nextCalls} 次`)
+      assert.equal(agent.notices.length, 1, `L23 / ${tool}：必须恰好投递一条提醒，实际 ${agent.notices.length} 条`)
+      const text = agent.notices[0]?.content?.[0]?.text
+      assert.match(text, new RegExp(`^\\[team-gate\\] 提醒：本轮还没有派发成员，执行工具「${tool}」`), `L23 / ${tool}：必须归类为「执行工具」并点名工具名，实际「${text}」`)
+      assert.match(text, /执行工具本身就是取证与实现的等价通道/, `L23 / ${tool}：必须说明它是取证与实现的等价通道，实际「${text}」`)
+      assert.match(text, /team_task_create[\s\S]*spawn_teammate/, `L23 / ${tool}：必须给出正确做法，实际「${text}」`)
+      assert.deepEqual(host.warnings, [], `L23 / ${tool}：提醒投递不属于 fail-open，不得 warn，实际：${JSON.stringify(host.warnings)}`)
     })
   }
 })
 
-test('L24 本轮已 spawn_teammate 且有 running 成员：Lead 的执行类工具放行（门禁判「本轮是否已派出活」，不是一律封执行）', async (t) => {
+test('L24 本轮已 spawn_teammate：Lead 的执行类工具放行且不提醒（门禁判「本轮是否已派出活」，不是一律提醒执行）', async (t) => {
   for (const tool of EXECUTION_TOOLS) {
     await t.test(tool, async () => {
       const host = leadHost()
       apply(host.ctx)
       const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('team_task_create'), toolCall('spawn_teammate'), memberEvent('m1')])
-      await assertAllowed(t, host, tool, agent, `L24 本轮已派发且有 running 成员（${tool}）`)
+      await assertAllowed(t, host, tool, agent, `L24 本轮已派发（${tool}）`)
     })
   }
 })
