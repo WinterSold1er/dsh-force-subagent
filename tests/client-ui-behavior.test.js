@@ -611,3 +611,286 @@ test('buildModelOptions：当前值兜底、去重、目录三态与 policy-empt
   assert.deepEqual(plain(unfiltered.providers).map(function (group) { return group.provider; }), ['dp', 'pl'],
     '当前实现不按 routableProviders 过滤（记录既有行为，不是期望特性）');
 });
+
+test('面板头有退出按钮：点击调用 layout.selectPanel(null) 且不写配置', () => {
+  const env = makeEnv({
+    config: { value: { enabled: true, workspaces: {} }, revision: 1 },
+    policy: { status: 'ready', value: { enabled: false, allowedModels: [] } },
+    workspaces: WORKSPACES,
+    catalog: CATALOG_OK,
+  });
+  const panel = env.panel();
+  panel.render();
+  const tree = panel.render();
+
+  const headers = collectNodes(tree).filter(function (node) { return node.type === 'header'; });
+  assert.equal(headers.length, 1, '面板必须只有一个 header');
+
+  const exit = collectNodes(tree).filter(function (node) {
+    return node.type === 'button' && node.props['aria-label'] === '退出强制委派面板，返回当前会话';
+  });
+  assert.equal(exit.length, 1, '整棵树里有且只有一个带退出可访问名称的按钮');
+  assert.ok(textOf(exit[0].children).length > 0, '退出按钮必须有可见文字');
+  assert.equal(exit[0].props.type, 'button');
+  assert.equal(typeof exit[0].props.onClick, 'function', '没有 onClick 的就是假按钮');
+
+  const inHeader = collectNodes(headers[0]).filter(function (node) { return node.type === 'button'; });
+  assert.equal(inHeader.length, 1, '退出按钮必须挂在面板头上');
+
+  exit[0].props.onClick();
+  assert.deepEqual(env.panelCalls, [null], '退出必须走宿主 selectPanel(null)，而不是假关闭');
+  assert.equal(env.mutations.length, 0, '退出不该产生任何配置写入');
+});
+
+test('退出时宿主 selectPanel 抛错不得炸页面，只落 warn', () => {
+  const env = makeEnv({
+    config: { value: { enabled: true, workspaces: {} }, revision: 1 },
+    policy: { status: 'ready', value: { enabled: false, allowedModels: [] } },
+    workspaces: WORKSPACES,
+    catalog: CATALOG_OK,
+  });
+  env.ctx.layout.selectPanel = function () { throw new Error('layout gone'); };
+  const panel = env.panel();
+  panel.render();
+  const tree = panel.render();
+  const exit = collectNodes(tree).filter(function (node) {
+    return node.type === 'button' && node.props['aria-label'] === '退出强制委派面板，返回当前会话';
+  });
+  assert.equal(exit.length, 1);
+  assert.doesNotThrow(function () { exit[0].props.onClick(); });
+  assert.equal(env.panelCalls.length, 0);
+  assert.equal(env.warns.filter(function (m) { return m.indexOf('切换面板失败') >= 0; }).length, 1,
+    '异常必须被记到 warn，不能空 catch 吞掉');
+});
+
+// ---------------------------------------------------------------- 团队成员上限控件
+
+const LIMIT_INPUT = 'fsx-member-limit';
+const LIMIT_CONFIG = { enabled: true, mode: 'nested', workspaces: {} };
+
+function limitEnv() {
+  const env = makeEnv({
+    config: { value: LIMIT_CONFIG, revision: 3 },
+    policy: { status: 'ready', value: { enabled: false, allowedModels: [] } },
+    workspaces: WORKSPACES,
+    catalog: CATALOG_OK,
+  });
+  return env;
+}
+
+/** 挂好面板并返回当前树（两次 render 让 effect 真的跑一遍）。 */
+async function limitPanel(env) {
+  const panel = env.panel();
+  panel.render();
+  await settle();
+  return { panel, tree: panel.render() };
+}
+
+function findByClass(tree, tone) {
+  return collectNodes(tree).filter(function (node) {
+    return (node.props.className || '').indexOf(tone) >= 0;
+  });
+}
+
+function limitApply(tree) {
+  const found = findByText(tree, '应用上限', 'button');
+  assert.equal(found.length, 1, '「应用上限」按钮必须有且只有一个');
+  assert.equal(typeof found[0].props.onClick, 'function', '没有 onClick 的应用按钮就是摆设');
+  return found[0];
+}
+
+test('成员上限控件：label、number 输入、应用按钮与来源说明齐备且互相关联', async () => {
+  const { tree } = await limitPanel(limitEnv());
+
+  const inputs = findById(tree, LIMIT_INPUT);
+  assert.equal(inputs.length, 1, '上限输入必须有且只有一个');
+  assert.equal(inputs[0].type, 'input');
+  assert.equal(inputs[0].props.type, 'number');
+  assert.equal(inputs[0].props.min, 1);
+  assert.equal(inputs[0].props.max, 1000);
+  assert.equal(inputs[0].props.step, 1);
+  assert.equal(inputs[0].props.inputMode, 'numeric');
+  assert.equal(typeof inputs[0].props.onChange, 'function');
+
+  const labels = collectNodes(tree).filter(function (node) {
+    return node.type === 'label' && node.props.htmlFor === LIMIT_INPUT;
+  });
+  assert.equal(labels.length, 1, '输入必须有 label，键盘与读屏用户才找得到');
+  assert.ok(textOf(labels[0].children).indexOf('团队成员上限') >= 0);
+
+  const hintNode = findById(tree, inputs[0].props['aria-describedby']);
+  assert.equal(hintNode.length, 1, 'aria-describedby 必须指向真实存在的说明');
+  const hint = textOf(hintNode[0].children);
+  ['服务', 'home-patch', 'profile-patch', 'default'].forEach(function (source) {
+    assert.ok(hint.indexOf(source) >= 0, '说明必须列出来源 ' + source);
+  });
+
+  limitApply(tree);
+});
+
+test('成员上限非法值：就地报错、不留成功提示、零宿主调用也不写配置', async () => {
+  const env = limitEnv();
+  const { panel, tree } = await limitPanel(env);
+  let current = tree;
+
+  ['', '   ', '0', '-3', '1.5', '1001', 'abc', '1e3', '0x10', '１０', '12,5'].forEach(function (raw) {
+    findById(current, LIMIT_INPUT)[0].props.onChange({ target: { value: raw } });
+    current = panel.render();
+    limitApply(current).props.onClick();
+    current = panel.render();
+
+    const errors = findByClass(current, 'fsx-feedback--error');
+    assert.equal(errors.length, 1, '非法值 ' + JSON.stringify(raw) + ' 必须落一条就地提示');
+    assert.equal(errors[0].props.role, 'alert', '就地提示必须是 alert，读屏才播报');
+    const message = textOf(errors[0].children);
+    assert.ok(message.indexOf('成员上限') >= 0, '提示必须点名是哪个字段：' + message);
+    assert.ok(message.indexOf('收到') >= 0, '提示必须说明收到了什么：' + message);
+    assert.equal(findByClass(current, 'fsx-feedback--ok').length, 0, '非法值不得同时冒充成功反馈');
+  });
+
+  assert.equal(env.mutations.length, 0, '非法值不得产生任何宿主写入');
+  assert.equal(env.namespaces.filter(function (ns) { return ns !== PANEL_ID && ns !== POLICY_NS; }).length, 0,
+    '校验失败不得去碰任何新的宿主命名空间');
+  assert.deepEqual(env.configValue(), LIMIT_CONFIG, '非法值不得改动配置');
+});
+
+test('成员上限合法值：经 configForms 真的写入 maxMembers，写载荷与 revision 围栏都对', async () => {
+  const env = limitEnv();
+  const { panel, tree } = await limitPanel(env);
+
+  findById(tree, LIMIT_INPUT)[0].props.onChange({ target: { value: '64' } });
+  const after = panel.render();
+  limitApply(after).props.onClick();
+  await settle();
+  const done = panel.render();
+
+  assert.equal(env.mutations.length, 1, '合法值必须真的发一次宿主写入，而不是只给命令');
+  const call = env.mutations[0];
+  assert.equal(call.operations.length, 1, '只发一条 maxMembers 写入');
+  assert.equal(call.operations[0].op, 'set', 'op 必须是 set');
+  assert.equal(call.operations[0].path.length, 1, '写路径必须只有一个段');
+  assert.equal(call.operations[0].path[0], 'maxMembers', '写路径必须点名 maxMembers');
+  assert.equal(call.operations[0].value, 64, '写载荷必须带数值');
+  assert.equal(typeof call.revision, 'number', '必须带 revision 围栏');
+  assert.equal(env.configValue().maxMembers, 64, '写入必须落到配置');
+  assert.equal(findByClass(done, 'fsx-feedback--error').length, 0, '成功不得落 error');
+});
+
+test('成员上限即时生效态：宿主回写 applied 时面板显示即时生效与真实来源', async () => {
+  const env = makeEnv({
+    config: { value: { enabled: true, mode: 'nested', workspaces: {}, maxMembers: 64,
+      maxMembersStatus: { state: 'applied', requested: 64, limit: 64, source: 'service', message: '' } }, revision: 3 },
+    policy: { status: 'ready', value: { enabled: false, allowedModels: [] } },
+    workspaces: WORKSPACES,
+    catalog: CATALOG_OK,
+  });
+  const { panel, tree } = await limitPanel(env);
+  findById(tree, LIMIT_INPUT)[0].props.onChange({ target: { value: '64' } });
+  const done = panel.render();
+
+  const status = collectNodes(done).filter(function (node) {
+    return (node.props.className || '').indexOf('fsx-feedback') >= 0
+      && textOf(node.children).indexOf('已即时生效') >= 0;
+  });
+  assert.equal(status.length, 1, 'applied 状态必须显示即时生效');
+  assert.equal(status[0].props.role, 'status');
+  const text = textOf(status[0].children);
+  assert.ok(text.indexOf('来源：service') >= 0, '必须显示真实来源，不得用 Config 默认值冒充：' + text);
+});
+
+test('成员上限需重启态：宿主回写 restart-required 时面板显示需重启并区分写入值/运行时值', async () => {
+  const env = makeEnv({
+    config: { value: { enabled: true, mode: 'nested', workspaces: {}, maxMembers: 24,
+      maxMembersStatus: { state: 'restart-required', requested: 24, limit: 16, source: 'home-patch', message: '' } }, revision: 3 },
+    policy: { status: 'ready', value: { enabled: false, allowedModels: [] } },
+    workspaces: WORKSPACES,
+    catalog: CATALOG_OK,
+  });
+  const { tree } = await limitPanel(env);
+  const done = tree;
+
+  const status = collectNodes(done).filter(function (node) {
+    return (node.props.className || '').indexOf('fsx-feedback') >= 0
+      && textOf(node.children).indexOf('需重启') >= 0;
+  });
+  assert.equal(status.length, 1, 'restart-required 状态必须显示需重启');
+  const text = textOf(status[0].children);
+  assert.ok(text.indexOf('已写入 24') >= 0, '必须显示写入值：' + text);
+  assert.ok(text.indexOf('当前运行时 16') >= 0, '必须区分当前运行时值：' + text);
+  assert.ok(text.indexOf('home-patch') >= 0, '必须显示真实来源：' + text);
+});
+
+test('成员上限失败态：宿主拒绝写入(mutate 抛错)时贴出宿主原文且配置不被改', async () => {
+  const env = limitEnv();
+  env.form.mutate = function () {
+    return Promise.reject(new Error('Config field "maxMembers" is not volatile'));
+  };
+  const { panel, tree } = await limitPanel(env);
+
+  findById(tree, LIMIT_INPUT)[0].props.onChange({ target: { value: '12' } });
+  const after = panel.render();
+  limitApply(after).props.onClick();
+  await settle();
+  const done = panel.render();
+
+  const errors = collectNodes(done).filter(function (node) {
+    return (node.props.className || '').indexOf('fsx-feedback--error') >= 0;
+  });
+  assert.equal(errors.length, 1, '失败必须落到上限控件自己的反馈行');
+  assert.equal(errors[0].props.role, 'alert');
+  const message = textOf(errors[0].children);
+  assert.ok(message.indexOf('maxMembers') >= 0 && message.indexOf('is not volatile') >= 0, '必须贴出宿主原文：' + message);
+  assert.notEqual(env.configValue().maxMembers, 12, '宿主拒绝写入时配置不得被改');
+});
+
+test('成员上限失败态：命名空间不可用时贴出命名空间并零宿主调用', async () => {
+  const env = limitEnv();
+  env.form.getSnapshot = function () {
+    return { status: 'unavailable', value: null, revision: 0, writable: false };
+  };
+  const { panel, tree } = await limitPanel(env);
+
+  findById(tree, LIMIT_INPUT)[0].props.onChange({ target: { value: '12' } });
+  const after = panel.render();
+  limitApply(after).props.onClick();
+  await settle();
+  const done = panel.render();
+
+  const errors = collectNodes(done).filter(function (node) {
+    return (node.props.className || '').indexOf('fsx-feedback--error') >= 0;
+  });
+  assert.equal(errors.length, 1, '失败必须落到上限控件自己的反馈行');
+  const message = textOf(errors[0].children);
+  assert.ok(message.indexOf('dsh-force-subagent') >= 0, '必须贴出是哪个命名空间不可用：' + message);
+  assert.equal(env.mutations.length, 0, '命名空间不可用时不得发起写入');
+});
+
+test('parseMemberLimit：只接受 1..1000 的正整数，拒绝时说明收到了什么', () => {
+  const { __test } = limitEnv().plugin;
+
+  [['1', 1], ['1000', 1000], [' 64 ', 64], ['064', 64], [64, 64], [1, 1], [1000, 1000]]
+    .forEach(function (pair) {
+      const parsed = __test.parseMemberLimit(pair[0]);
+      assert.equal(parsed.ok, true, JSON.stringify(pair[0]) + ' 应当合法');
+      assert.equal(parsed.limit, pair[1]);
+      assert.equal(parsed.error, undefined);
+    });
+
+  ['', '   ', '0', '00', '-1', '1001', '1001.0', '1.5', '1e3', '0x10', '１０', 'abc', '64px', 'NaN', 'Infinity']
+    .forEach(function (raw) {
+      const parsed = __test.parseMemberLimit(raw);
+      assert.equal(parsed.ok, false, JSON.stringify(raw) + ' 必须被拒绝');
+      assert.equal(parsed.limit, undefined);
+      assert.ok(parsed.error.indexOf('成员上限') >= 0);
+      assert.ok(parsed.error.indexOf('收到') >= 0, '拒绝必须说明收到了什么：' + parsed.error);
+    });
+
+  [null, undefined, {}, [], true, false, Number.NaN].forEach(function (raw) {
+    const parsed = __test.parseMemberLimit(raw);
+    assert.equal(parsed.ok, false, String(raw) + ' 必须被拒绝');
+    assert.ok(parsed.error.indexOf('正整数') >= 0);
+  });
+
+  assert.equal(__test.parseMemberLimit('1001').error.indexOf('1000') >= 0, true,
+    '拒绝理由必须暴露护栏上限');
+});

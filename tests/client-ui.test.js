@@ -441,3 +441,144 @@ test('client.js 的样式与可访问性硬性要求存在', () => {
   assert.match(CODE, /aria-describedby/);
   assert.match(CODE, /data-plugin/);
 });
+
+test('面板头退出控件走宿主 selectPanel(null)', () => {
+  assert.match(CODE, /function closePanel\(\)/);
+  assert.match(CODE, /selectPanelSafely\(null\)/);
+  assert.match(CODE, /'aria-label':\s*'退出[^\n]*'/);
+  assert.match(CODE, /onClick:\s*closePanel/);
+});
+
+test('窄屏 320/375px：header 换行、chip 可收缩、长串不撑破容器，且不用 display:none 藏内容', () => {
+  assert.match(CODE, /\.fsx-header\{[^}]*flex-wrap:wrap[^}]*\}/, 'header 必须允许换行');
+  assert.match(CODE, /\.fsx-heading\{[^}]*flex:1 1 auto[^}]*min-width:0/, '标题区必须可增长可收缩');
+  assert.doesNotMatch(CODE, /\.fsx-chip\{[^}]*white-space:nowrap/, 'chip 不得再锁死为不可换行');
+  assert.match(CODE, /\.fsx-chip\{[^}]*flex:0 1 auto[^}]*min-width:0/, 'chip 必须允许收缩');
+  assert.match(CODE, /#dsh-force-subagent\{[^}]*overflow-wrap:break-word/, '根容器必须仍能换行超长串；不得用 anywhere——anywhere 会把 flex 项的 min-content 塌到单字');
+  assert.match(CODE, /#dsh-force-subagent\{[^}]*width:100%;max-width:640px/, '面板必须是流式宽度（窄屏上限 640px，不再是 560px 窄条）');
+  assert.doesNotMatch(CODE, /\.fsx-[a-z-]+\{[^}]*display:none/, '不得用 display:none 掩盖溢出');
+  assert.match(CODE, /\.fsx-input\{[^}]*width:100%[^}]*max-width:140px/, '成员上限输入必须可收缩，不得定宽撑破窄屏');
+  assert.match(CODE, /\.fsx-input\{[^}]*min-height:44px/, '成员上限输入必须是 44px 触控目标');
+  assert.match(CODE, /\.fsx-field\{[^}]*min-width:0/, '上限所在卡片字段必须可收缩');
+  assert.match(CODE, /\.fsx-savebar\{[^}]*flex-wrap:wrap/, '上限一行必须复用可换行的按钮排');
+  assert.match(CODE, /className: 'fsx-card fsx-field'(?:(?!className: 'fsx-card)[\s\S]){0,900}id: 'fsx-member-limit'/,
+    '成员上限必须挂在可换行的卡片字段里，而不是浮在卡外（输入与卡片开标签之间不得跨入另一张卡）');
+  const fixedWidths = [...CODE.matchAll(/(?<![-\w])width:(\d+)px/g)].map((m) => Number(m[1]));
+  assert.ok(fixedWidths.length > 0, '遍历必须真的抓到固定宽度声明，否则下一条断言是空判');
+  assert.ok(fixedWidths.every((w) => w < 300), '固定宽度不得逼近 320px 视口：' + fixedWidths.join(','));
+});
+
+test('窄屏 ≤560px：退出按钮触控目标 44px，宽屏保持 32px 紧凑高度', () => {
+  const narrow = /@media \(max-width:560px\)\{\.fsx-exit\{([^}]*)\}\}/.exec(CODE)?.[1] ?? '';
+  assert.ok(narrow !== '', '必须存在窄屏 .fsx-exit 断点，否则下面三条是空判');
+  assert.match(narrow, /min-height:44px/, '窄屏退出按钮必须达到 44px 触控目标');
+  assert.match(narrow, /padding:0 12px/, '窄屏必须同步放宽横向内边距');
+  assert.match(CODE, /\.fsx-exit\{[^}]*min-height:32px/, '宽屏基线保持 32px 紧凑高度');
+  const reduced = /@media \(prefers-reduced-motion:reduce\)\{([\s\S]*?)\n\s*'\}/.exec(CODE)?.[1] ?? '';
+  assert.ok(reduced.includes('.fsx-exit,.fsx-exit svg{transition:none;}'), 'reduced-motion 段不得被改动');
+  assert.doesNotMatch(reduced, /min-height/, 'reduced-motion 段不得掺入尺寸规则');
+});
+
+test('面板根必须自带滚动：任意视口高度都滚得到底部，禁止 hidden/clip 裁切', () => {
+  const root = /#dsh-force-subagent\{([\s\S]*?)\n\s*'\}/.exec(CODE)?.[1] ?? '';
+  assert.ok(root !== '', '必须抓到 #dsh-force-subagent 根规则，否则下面四条全是空判');
+  assert.match(root, /height:100%;min-height:0/, '根必须把高度绑到宿主内容区、且允许收缩到可用高度（flex 项的自动最小尺寸会把内容顶出去）');
+  assert.match(root, /max-height:100vh/, '宿主高度不可解析时必须有无条件兜底，保证一定可滚');
+  assert.match(root, /overflow-y:auto/, '超出部分必须落到面板内部滚动，而不是被宿主 overflow:hidden 裁掉');
+  assert.doesNotMatch(root, /overflow(-y)?:\s*(hidden|clip)/, '不得用 hidden/clip 藏内容');
+});
+
+test('两列看面板自身可用宽度而不是看视口：1024 视口（宿主侧栏 280px → 面板 744px）必须仍单列', () => {
+  const wide = /@media \(min-width:1000px\)\{([\s\S]*?)\}\}/.exec(CODE)?.[1] ?? '';
+  assert.ok(wide.includes('max-width:1152px'), '桌面内容块必须定宽居中（1152 含 24 内边距 → 1104 内容）');
+  const container = /@container \(min-width:900px\)\{([\s\S]*?)\}\}/.exec(CODE)?.[1] ?? '';
+  assert.ok(container !== '', '两列必须写在 @container 断点里，否则下面两条是空判');
+  assert.match(container, /\.fsx-cards\{grid-template-columns:repeat\(2,minmax\(320px,1fr\)\)/, '只有面板自身内容宽度 ≥900px 才排两列');
+  assert.doesNotMatch(CODE, /@media \(min-width:\d+px\)\{[^}]*\.fsx-cards\{[^}]*repeat\(2,/,
+    '两列不得再由视口宽度决定：1024 视口会触发 1000px 媒体查询，而面板只有 744px，两列会把每张卡压到 338px');
+  assert.match(CODE, /#dsh-force-subagent\{[^}]*container-type:inline-size/, '面板必须声明成容器查询的容器，否则 @container 永不生效');
+  assert.match(CODE, /\.fsx-cards\{display:grid;grid-template-columns:minmax\(0,1fr\);/, '默认必须单列栅格');
+  assert.match(CODE, /className: 'fsx-cards'/, '卡片必须被包进 .fsx-cards 栅格容器，否则两列无从生效');
+});
+
+test('间距节奏统一 8/12/16/24：卡片外间距交给栅格 gap，不叠加 margin', () => {
+  assert.match(CODE, /\.fsx-header\{[^}]*margin:0 calc\(var\(--fsx-bleed\) \* -1\) 12px/, '头部向外扩出血，下间距仍是 12px');
+  assert.match(CODE, /#dsh-force-subagent\{[^}]*padding:0 var\(--fsx-pad\)/, '面板不得自带上下内边距：sticky 会被 containing block 夹在 padding 内侧，滚到底头部停在 y=24 并漏出一条卡片穿过的缝');
+  assert.match(CODE, /\.fsx-subtitle\{[^}]*margin:0 0 16px/, '副标题下间距 16px');
+  assert.match(CODE, /\.fsx-field\{[^}]*gap:8px/, '字段内间距 8px');
+  assert.match(CODE, /\.fsx-card\{[^}]*padding:16px[^}]*margin:0/, '卡片内 16px、外 0，避免与栅格 gap 叠加');
+  assert.match(CODE, /\.fsx-grid\{[^}]*repeat\(auto-fit,minmax\(180px,1fr\)\)/, '卡内 Provider/Model 必须自适应，窄卡片自动改单列');
+  assert.doesNotMatch(CODE, /@media \(min-width:480px\)\{\.fsx-grid/, '旧的 480px 定宽两列已被自适应栅格取代');
+});
+
+test('头部必须吸顶、面板级保存条必须吸底：滚到底标题/退出/保存设置仍在裁剪框内', () => {
+  const header = /\.fsx-header\{([^}]*)\}/.exec(CODE)?.[1] ?? '';
+  assert.ok(header !== '', '必须抓到 .fsx-header 规则，否则下面四条是空判');
+  assert.match(header, /position:sticky/, '头部必须 sticky');
+  assert.match(header, /top:0/, 'sticky 必须贴住滚动容器上边缘（滚到底 getBoundingClientRect().top === 0）');
+  assert.match(header, /z-index:3/, '头部必须压在被它盖住的卡片之上');
+  assert.match(header, /background:var\(--fsx-bg\)/, '头部必须有不透明背景，否则卡片从底下穿过时糊成一团');
+  assert.match(header, /flex-wrap:wrap/, 'sticky 后 header 仍必须允许换行');
+  const bar = /#dsh-force-subagent>\.fsx-savebar\{([^}]*)\}/.exec(CODE)?.[1] ?? '';
+  assert.ok(bar !== '', '面板直接子级的保存条必须单独定义，否则卡片内那条 savebar 也会被一起吸底、两条叠在一起');
+  assert.match(bar, /position:sticky/, '保存条必须吸底，让保存设置在任意滚动位置都可见');
+  assert.match(bar, /bottom:0/, '保存条必须贴滚动容器下边缘');
+  assert.match(bar, /background:var\(--fsx-bg\)/, '吸底的保存条必须有不透明背景');
+  const baseBar = /\.fsx-savebar\{([^}]*)\}/.exec(CODE)?.[1] ?? '';
+  assert.ok(baseBar.includes('display:flex'), '必须抓到基线 .fsx-savebar 规则本身');
+  assert.doesNotMatch(baseBar, /position:sticky/, 'sticky 只能加在面板直接子级那条，不得污染卡片内的那条');
+});
+
+test('卡标题不得逐字断行：卡头整块换行、标题整词保宽、不自我压缩', () => {
+  const head = /\.fsx-card-head\{([^}]*)\}/.exec(CODE)?.[1] ?? '';
+  assert.ok(head !== '', '必须抓到 .fsx-card-head 规则，否则下面三条是空判');
+  assert.match(head, /flex-wrap:wrap/, '卡头必须允许整块换行，而不是把标题挤到一字一行');
+  assert.match(head, /gap:4px 12px/, '卡头行间距小于列间距');
+  const title = /\.fsx-card-title\{([^}]*)\}/.exec(CODE)?.[1] ?? '';
+  assert.ok(title !== '', '必须抓到 .fsx-card-title 规则');
+  assert.match(title, /word-break:keep-all/, '中日韩文本默认在任意字间断行，标题必须 keep-all 才能保持整词');
+  assert.doesNotMatch(title, /min-width:0/, 'min-width:0 会让标题被 flex 压缩到单字宽（375 下 24x72 的成因）');
+  assert.doesNotMatch(title, /white-space:nowrap/, '标题不得 nowrap 横向撑破卡片');
+});
+
+test('卡片不得被栅格拉成等高空高；卡片/头部/保存条的文字落在同一条内容基线上', () => {
+  const cards = /\.fsx-cards\{([^}]*)\}/.exec(CODE)?.[1] ?? '';
+  assert.match(cards, /align-items:start/, '栅格不得把每张卡拉到整行最高——固定卡高不吸收内容，只制造底部空档');
+  assert.match(CODE, /#dsh-force-subagent\{[^}]*display:flex;flex-direction:column/, '面板必须纵向 flex，卡区才谈得上吸收剩余高度');
+  assert.match(cards, /flex:1 1 auto/, '卡区必须吸收面板剩余高度');
+  assert.match(cards, /align-content:space-evenly/, '多余高度均匀分配到卡片上/行/下，而不是堆在页面底部（1920 底部空 278 的成因）');
+  assert.match(cards, /margin:0 calc\(var\(--fsx-bleed\) \* -1\)/, '卡片向留白方向外扩 bleed，卡内文字才能与面板内容基线对齐');
+  assert.match(CODE, /--fsx-bleed:17px/, 'bleed 必须等于卡内边距 16 + 卡描边 1');
+  assert.match(CODE, /--fsx-pad:24px/, '面板内边距必须走同一令牌，头部才能按同样的距离外扩');
+  const header = /\.fsx-header\{([^}]*)\}/.exec(CODE)?.[1] ?? '';
+  const bar = /#dsh-force-subagent>\.fsx-savebar\{([^}]*)\}/.exec(CODE)?.[1] ?? '';
+  assert.match(header, /padding:var\(--fsx-pad\) var\(--fsx-bleed\)/, '头部外扩后必须用同样的 padding 把文字送回基线');
+  assert.match(bar, /padding:12px var\(--fsx-bleed\)/, '保存条同理，不得比卡内文字缩进 17px');
+});
+
+test('字阶分三级：11 辅助 / 13 正文 / 20 标题，卡标题 14 与 label 12 区分，不再只靠字重', () => {
+  const sizes = {
+    eyebrow: /\.fsx-eyebrow\{[^}]*font-size:(\d+)px/,
+    title: /\.fsx-title\{[^}]*font-size:(\d+)px/,
+    subtitle: /\.fsx-subtitle\{[^}]*font-size:(\d+)px/,
+    cardTitle: /\.fsx-card-title\{[^}]*font-size:(\d+)px/,
+    label: /\.fsx-label\{[^}]*font-size:(\d+)px/,
+    hint: /\.fsx-hint\{[^}]*font-size:(\d+)px/,
+    desc: /\.fsx-card-desc\{[^}]*font-size:(\d+)px/,
+  };
+  const got = {};
+  for (const [name, re] of Object.entries(sizes)) {
+    const hit = re.exec(CODE)?.[1];
+    assert.ok(hit !== undefined, `必须抓到 ${name} 的字号声明`);
+    got[name] = Number(hit);
+  }
+  assert.equal(got.title, 20, '主标题 20');
+  assert.equal(got.cardTitle, 14, '卡标题 14，必须高于正文');
+  assert.equal(got.subtitle, 13, '副标题走正文级 13');
+  assert.equal(got.label, 12, 'label 12，必须与卡标题 14 区分');
+  assert.equal(got.hint, 11, '辅助说明 11');
+  assert.equal(got.desc, 11, '卡内说明同属辅助级 11');
+  assert.equal(got.eyebrow, 11, '眉标 11');
+  const distinct = new Set(Object.values(got));
+  assert.ok(distinct.size >= 4, '同一页面上至少要有 4 个可区分的字号，不能只靠字重：' + [...distinct].join('/'));
+});

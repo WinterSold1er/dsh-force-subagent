@@ -239,6 +239,48 @@ window.__ModuleLoader__.load({
       });
     }
 
+    /** 成员上限护栏，与宿主侧 index.js:464 `MAX_MEMBER_LIMIT = 1000` 对齐（宿主默认 16）。 */
+    var MEMBER_LIMIT_MAX = 1000;
+
+    /** 成员上限校验：只接受 1..MEMBER_LIMIT_MAX 的十进制正整数，其它一律就地拒绝并说明收到了什么。 */
+    function parseMemberLimit(value) {
+      var raw = typeof value === 'number' ? String(value)
+        : typeof value === 'string' ? value.trim() : '';
+      if (!/^\d+$/.test(raw)) {
+        return {
+          ok: false,
+          error: '成员上限必须是 1–' + MEMBER_LIMIT_MAX + ' 的正整数（收到“' + (raw === '' ? '空' : raw) + '”）。',
+        };
+      }
+      var numeric = Number(raw);
+      if (numeric < 1 || numeric > MEMBER_LIMIT_MAX) {
+        return { ok: false, error: '成员上限必须在 1–' + MEMBER_LIMIT_MAX + ' 之间（收到 ' + raw + '）。' };
+      }
+      return { ok: true, limit: numeric };
+    }
+
+    /**
+     * 把宿主回写的 maxMembersStatus 映射为面板文案（纯函数，暴露给测试）。
+     * 状态一律来自宿主回读（readMemberLimit 的真实来源），绝不用 Config 默认值冒充当前值。
+     * applied：即时生效；restart-required：已持久化但需重启；loaded：载入时读到的当前真值；error：宿主失败原文。
+     */
+    function memberLimitStatusText(status) {
+      if (!isObject(status)) return null;
+      if (status.state === 'applied') {
+        return { tone: 'ok', text: '已即时生效（当前 ' + status.limit + '，来源：' + status.source + '）。' };
+      }
+      if (status.state === 'restart-required') {
+        return { tone: 'warn', text: '已写入 ' + status.requested + '，需重启宿主才生效（当前运行时 ' + status.limit + '，来源：' + status.source + '）。' };
+      }
+      if (status.state === 'loaded') {
+        return { tone: 'ok', text: '当前 ' + status.limit + '（来源：' + status.source + '）。' };
+      }
+      if (status.state === 'error') {
+        return { tone: 'error', text: status.message || '成员上限写入失败。' };
+      }
+      return null;
+    }
+
     function policyRoutes(snapshot) {
       if (!isObject(snapshot) || snapshot.status !== 'ready' || !isObject(snapshot.value)) {
         return { active: false, routes: [] };
@@ -350,43 +392,57 @@ window.__ModuleLoader__.load({
       '--fsx-ok:var(--dsw-alias-state-success-primary,#22c55e);',
       '--fsx-warn:var(--dsw-alias-state-warn-primary,#f59e0b);',
       '--fsx-err:var(--dsw-alias-state-error-primary,#ec1313);',
-      'width:100%;max-width:560px;margin:0 auto;padding:28px 24px 44px;',
+      /* --fsx-pad 面板内边距；--fsx-bleed = 卡内边距 16 + 卡描边 1。
+         卡片向留白方向外扩 --fsx-bleed，卡内文字与头部/保存条文字落在同一条基线。 */
+      '--fsx-pad:24px;',
+      '--fsx-bleed:17px;',
+      'width:100%;max-width:640px;margin:0 auto;padding:0 var(--fsx-pad);container-type:inline-size;display:flex;flex-direction:column;',
       'color:var(--fsx-text);font-family:var(--dsw-font-family,system-ui,-apple-system,"Segoe UI",sans-serif);',
-      'font-size:14px;line-height:22px;box-sizing:border-box;',
+      'font-size:14px;line-height:22px;box-sizing:border-box;overflow-wrap:break-word;',
+      'height:100%;min-height:0;max-height:100vh;overflow-y:auto;overscroll-behavior:contain;',
       'animation:fsx-rise var(--ds-transition-duration-slow,.3s) var(--ds-ease-in-out,ease) both;',
       '}',
       '#dsh-force-subagent *,#dsh-force-subagent *::before,#dsh-force-subagent *::after{box-sizing:border-box;}',
       '#dsh-force-subagent :focus-visible{outline:2px solid var(--fsx-accent);outline-offset:2px;}',
-      '.fsx-header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:10px;}',
-      '.fsx-heading{display:flex;align-items:center;gap:12px;min-width:0;}',
+      /* 面板上下内边距为 0：顶部留白由吸顶头部自己的 padding 提供，sticky 才不会被
+         containing block 夹在 padding 内侧（否则滚到底停在 y=24，头部上方漏出一条卡片穿过的缝）。 */
+      '.fsx-header{position:sticky;top:0;z-index:3;display:flex;align-items:flex-start;flex-wrap:wrap;gap:10px 16px;margin:0 calc(var(--fsx-bleed) * -1) 12px;padding:var(--fsx-pad) var(--fsx-bleed) 12px;background:var(--fsx-bg);}',
+      '.fsx-heading{display:flex;align-items:center;gap:12px;flex:1 1 auto;min-width:0;}',
       '.fsx-mark{width:40px;height:40px;border-radius:12px;display:inline-flex;align-items:center;justify-content:center;background:var(--fsx-hover);color:var(--fsx-text);flex:none;}',
       '.fsx-eyebrow{margin:0 0 2px;font-size:11px;line-height:14px;letter-spacing:.12em;font-weight:600;color:var(--fsx-faint);}',
       '.fsx-title{margin:0;font-size:20px;line-height:28px;font-weight:600;letter-spacing:-.2px;}',
-      '.fsx-subtitle{margin:0 0 18px;color:var(--fsx-muted);font-size:13px;line-height:20px;}',
-      '.fsx-chip{display:inline-flex;align-items:center;gap:7px;padding:5px 10px;border-radius:999px;background:var(--fsx-hover);font-size:12px;line-height:16px;font-weight:500;white-space:nowrap;flex:none;}',
+      '.fsx-subtitle{margin:0 0 16px;color:var(--fsx-muted);font-size:13px;line-height:20px;}',
+      '.fsx-chip{display:inline-flex;align-items:center;gap:7px;padding:5px 10px;border-radius:999px;background:var(--fsx-hover);font-size:12px;line-height:16px;font-weight:500;flex:0 1 auto;min-width:0;}',
       '.fsx-dot{width:7px;height:7px;border-radius:999px;background:var(--fsx-muted);}',
       '.fsx-chip--ok .fsx-dot{background:var(--fsx-ok);}',
       '.fsx-chip--warn .fsx-dot{background:var(--fsx-warn);}',
       '.fsx-chip--error .fsx-dot{background:var(--fsx-err);}',
-      '.fsx-card{background:var(--fsx-card);border:1px solid var(--fsx-stroke);border-radius:var(--dsw-radius-md,12px);padding:16px;margin:0 0 12px;box-shadow:var(--dsw-elevation-soft,0 1px 2px rgba(0,0,0,.04));transition:border-color 160ms var(--ds-ease-in-out,ease),box-shadow 160ms var(--ds-ease-in-out,ease);}',
+      /* 卡片区吃掉面板剩余高度，多余空间均匀落到卡片上/行/下而不是堆成页面底部的大空档；
+         align-items:start 保证每张卡只用自己的内容高度，栅格不再生成等高空卡。 */
+      '.fsx-cards{display:grid;grid-template-columns:minmax(0,1fr);gap:12px;align-items:start;align-content:space-evenly;flex:1 1 auto;margin:0 calc(var(--fsx-bleed) * -1);}',
+      '.fsx-card{background:var(--fsx-card);border:1px solid var(--fsx-stroke);border-radius:var(--dsw-radius-md,12px);padding:16px;margin:0;box-shadow:var(--dsw-elevation-soft,0 1px 2px rgba(0,0,0,.04));transition:border-color 160ms var(--ds-ease-in-out,ease),box-shadow 160ms var(--ds-ease-in-out,ease);}',
       '.fsx-card:hover{border-color:var(--dsw-alias-border-l3,rgba(0,0,0,.16));}',
-      '.fsx-card-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:12px;}',
-      '.fsx-card-title{font-size:13px;font-weight:600;line-height:18px;margin:0;}',
-      '.fsx-card-desc{font-size:12px;line-height:17px;color:var(--fsx-faint);margin:0;}',
-      '.fsx-grid{display:grid;grid-template-columns:1fr;gap:12px;}',
-      '@media (min-width:480px){.fsx-grid{grid-template-columns:1fr 1fr;}}',
-      '.fsx-field{display:flex;flex-direction:column;gap:6px;min-width:0;}',
+      '.fsx-card-head{display:flex;align-items:baseline;justify-content:space-between;gap:4px 12px;flex-wrap:wrap;margin-bottom:10px;}',
+      /* 卡标题 keep-all：中日韩文本默认可在任意字间断行，卡头 flex 挤压时标题会塌成一字一行；
+         keep-all 关掉字间断行，标题保持整词宽度，放不下时整条说明换到下一行。 */
+      '.fsx-card-title{font-size:14px;font-weight:600;line-height:20px;margin:0;flex:1 1 auto;word-break:keep-all;}',
+      '.fsx-card-desc{font-size:11px;line-height:16px;color:var(--fsx-faint);margin:0;flex:0 1 auto;}',
+      '.fsx-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;}',
+      '.fsx-field{display:flex;flex-direction:column;gap:8px;min-width:0;}',
       '.fsx-label{font-size:12px;line-height:17px;font-weight:500;color:var(--fsx-muted);}',
       '.fsx-select{appearance:none;-webkit-appearance:none;width:100%;min-height:44px;padding:8px 34px 8px 12px;border:1px solid var(--fsx-hair);border-radius:var(--dsw-radius-sm,8px);background-color:var(--fsx-bg);color:var(--fsx-text);font:inherit;font-size:13px;line-height:20px;cursor:pointer;transition:border-color 160ms var(--ds-ease-in-out,ease),background 160ms var(--ds-ease-in-out,ease);background-image:url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 width=%2712%27 height=%278%27 viewBox=%270 0 12 8%27%3E%3Cpath d=%27M1 1.5 6 6.5l5-5%27 fill=%27none%27 stroke=%27%2381858c%27 stroke-width=%271.5%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;}',
       '.fsx-select:hover:not(:disabled){border-color:var(--dsw-alias-border-l3,rgba(0,0,0,.16));}',
       'body[data-ds-dark-theme] #dsh-force-subagent .fsx-select{background-image:url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 width=%2712%27 height=%278%27 viewBox=%270 0 12 8%27%3E%3Cpath d=%27M1 1.5 6 6.5l5-5%27 fill=%27none%27 stroke=%27%23cfd3d6%27 stroke-width=%271.5%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27/%3E%3C/svg%3E");}',
       '.fsx-select:disabled{opacity:.55;cursor:not-allowed;}',
-      '.fsx-hint{margin:0;font-size:12px;line-height:17px;color:var(--fsx-faint);}',
+      '.fsx-input{width:100%;max-width:140px;min-height:44px;padding:8px 12px;border:1px solid var(--fsx-hair);border-radius:var(--dsw-radius-sm,8px);background-color:var(--fsx-bg);color:var(--fsx-text);font:inherit;font-size:13px;line-height:20px;transition:border-color 160ms var(--ds-ease-in-out,ease),background 160ms var(--ds-ease-in-out,ease);}',
+      '.fsx-hint{margin:0;font-size:11px;line-height:16px;color:var(--fsx-faint);}',
       '.fsx-hint--error{color:var(--fsx-err);}',
       '.fsx-switch-row{display:flex;align-items:center;justify-content:space-between;gap:16px;}',
       '.fsx-switch-copy{display:flex;flex-direction:column;gap:3px;min-width:0;}',
       '.fsx-checkbox{width:18px;height:18px;accent-color:var(--fsx-accent);cursor:pointer;flex:none;}',
       '.fsx-savebar{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-top:16px;}',
+      /* 面板直接子级的保存条吸底：滚到任何位置「保存设置」都在首屏内，同时收尾底部留白。 */
+      '#dsh-force-subagent>.fsx-savebar{position:sticky;bottom:0;z-index:2;margin:16px calc(var(--fsx-bleed) * -1) 0;padding:12px var(--fsx-bleed) var(--fsx-pad);background:var(--fsx-bg);border-top:1px solid var(--fsx-hair);}',
       '.fsx-primary{min-height:44px;padding:0 18px;border:0;border-radius:var(--dsw-radius-sm,8px);background:var(--dsw-alias-button-primary-fill,#0f1115);color:var(--dsw-alias-label-primary-foreground,#fff);font:inherit;font-size:13px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:8px;transition:background 160ms var(--ds-ease-in-out,ease),transform 120ms var(--ds-ease-in-out,ease),opacity 160ms;}',
       '.fsx-primary:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover,#2a2a2e);}',
       '.fsx-primary:active:not(:disabled){transform:translateY(1px);}',
@@ -398,16 +454,28 @@ window.__ModuleLoader__.load({
       '.fsx-banner{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border-radius:var(--dsw-radius-sm,8px);background:var(--fsx-hover);font-size:12px;line-height:18px;color:var(--fsx-muted);margin:0 0 12px;}',
       '.fsx-banner strong{color:var(--fsx-text);font-weight:600;}',
       '.fsx-link{background:none;border:0;padding:0;color:var(--fsx-accent);font:inherit;font-size:12px;cursor:pointer;text-decoration:underline;text-underline-offset:2px;}',
+      '.fsx-exit{display:inline-flex;align-items:center;gap:6px;flex:none;min-height:32px;padding:0 10px;border:0.5px solid var(--fsx-hair);border-radius:8px;background:transparent;color:var(--fsx-muted);font:inherit;font-size:12px;line-height:20px;cursor:pointer;transition:background-color .18s var(--ds-ease-in-out,ease),border-color .18s var(--ds-ease-in-out,ease),color .18s var(--ds-ease-in-out,ease);}',
+      '.fsx-exit:hover{background:var(--fsx-hover);border-color:var(--fsx-stroke);color:var(--fsx-text);}',
+      '.fsx-exit:active{transform:translateY(.5px);}',
+      '.fsx-exit svg{width:14px;height:14px;transition:transform .18s var(--ds-ease-in-out,ease);}',
+      '.fsx-exit:hover svg{transform:translateX(-2px);}',
       '.fsx-empty{padding:18px;border:1px dashed var(--fsx-hair);border-radius:var(--dsw-radius-md,12px);text-align:center;color:var(--fsx-muted);font-size:13px;line-height:20px;}',
       '.fsx-skeleton{height:14px;border-radius:999px;background:var(--fsx-hover);animation:fsx-pulse 1.2s ease-in-out infinite;}',
       '@keyframes fsx-rise{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:none;}}',
       '@keyframes fsx-pulse{0%,100%{opacity:.45;}50%{opacity:.9;}}',
       '@keyframes fsx-spin{to{transform:rotate(360deg);}}',
+      '@media (min-width:1000px){#dsh-force-subagent{max-width:1152px;}}',
+      /* 两列看容器宽度而不是视口：宿主侧栏 280px，1024 视口下面板内容只有 696px，
+         按视口判断会切两列把每张卡压到 338px；900px 内容宽以下保持单列。 */
+      '@container (min-width:900px){.fsx-cards{grid-template-columns:repeat(2,minmax(320px,1fr));gap:16px;}}',
+      '@media (max-width:560px){.fsx-exit{min-height:44px;padding:0 12px;}}',
       '@media (prefers-reduced-motion:reduce){',
       '#dsh-force-subagent{animation:none;}',
       '#dsh-force-subagent *{transition-duration:0ms !important;}',
       '.fsx-skeleton,.fsx-spinner{animation:none !important;}',
       '.fsx-card{animation:none;}',
+      '.fsx-exit,.fsx-exit svg{transition:none;}',
+      '.fsx-exit:active,.fsx-exit:hover svg{transform:none;}',
       '}',
     ].join('\n');
 
@@ -476,15 +544,24 @@ window.__ModuleLoader__.load({
         };
       }
 
-      function openPanel(sessionId) {
-        bindSession(sessionId);
+      function selectPanelSafely(panelId) {
         try {
-          ctx.layout.selectPanel(PANEL);
+          ctx.layout.selectPanel(panelId);
         } catch (error) {
           if (ctx.logger !== undefined && ctx.logger !== null && typeof ctx.logger.warn === 'function') {
-            ctx.logger.warn('[force-subagent] 打开面板失败：' + (error instanceof Error ? error.message : String(error)));
+            ctx.logger.warn('[force-subagent] 切换面板失败：' + (error instanceof Error ? error.message : String(error)));
           }
         }
+      }
+
+      function openPanel(sessionId) {
+        bindSession(sessionId);
+        selectPanelSafely(PANEL);
+      }
+
+      /** 退出本页：宿主语义是 selectPanel(null) → 显示 Conversation，不改变当前会话。 */
+      function closePanel() {
+        selectPanelSafely(null);
       }
 
       /** 会话头按钮（工作区语境）：按钮本身就是自绘图标。 */
@@ -696,6 +773,12 @@ window.__ModuleLoader__.load({
         var notice = noticeState[0], setNotice = noticeState[1];
         var errorState = React.useState('');
         var error = errorState[0], setError = errorState[1];
+        var limitInputState = React.useState('');
+        var limitInput = limitInputState[0], setLimitInput = limitInputState[1];
+        var limitNoticeState = React.useState('');
+        var limitNotice = limitNoticeState[0], setLimitNotice = limitNoticeState[1];
+        var limitErrorState = React.useState('');
+        var limitError = limitErrorState[0], setLimitError = limitErrorState[1];
 
         var itemsVersion = workspaces.map(function (item) { return workspaceKeyOf(item) || ''; }).join('\u0001');
 
@@ -735,6 +818,8 @@ window.__ModuleLoader__.load({
         var editable = snapshot.status === 'ready' && selectedKey !== null && selectedKey !== undefined && busy !== true;
         var valid = draftIsValid(draft);
         var canSave = editable && valid;
+
+        var memberLimitStatus = memberLimitStatusText(isObject(snapshot.value) ? snapshot.value.maxMembersStatus : null);
 
         var chip = { tone: 'ok', text: '已就绪' };
         if (snapshot.status === 'loading') chip = { tone: 'warn', text: '加载中' };
@@ -778,6 +863,44 @@ window.__ModuleLoader__.load({
             Object.keys(previous).forEach(function (name) { next[name] = previous[name]; });
             next[field] = model;
             return next;
+          });
+        }
+
+        /**
+         * 成员上限「应用」：真写入。经 ctx.configForms.get(ENTRY).mutate 写 maxMembers（Config 已带 volatile 字段），
+         * 宿主写进 profile patch 后由插件接回 setMemberLimit 完成持久化 + 运行时改写。
+         * 非法值就地拦截、零调用；成功后的真实来源与生效状态由 subscribe 更新的 maxMembersStatus 呈现；失败显示宿主原文。
+         */
+        function applyMemberLimit() {
+          var parsed = parseMemberLimit(limitInput);
+          if (!parsed.ok) {
+            setLimitNotice('');
+            setLimitError(parsed.error);
+            return;
+          }
+          var fresh = form.getSnapshot();
+          if (fresh.status !== 'ready') {
+            setLimitNotice('');
+            setLimitError('宿主配置服务不可用或未就绪：' + ENTRY + ' 命名空间状态为 ' + fresh.status + '，无法写入成员上限。');
+            return;
+          }
+          setLimitError('');
+          setLimitNotice('正在写入 ' + parsed.limit + '…');
+          var pending;
+          try {
+            pending = form.mutate([{ op: 'set', path: ['maxMembers'], value: parsed.limit }], fresh.revision);
+          } catch (failure) {
+            setLimitNotice('');
+            setLimitError('写入失败：' + (failure instanceof Error ? failure.message : String(failure)));
+            return;
+          }
+          Promise.resolve(pending).then(function (ok) {
+            if (ok === true) setLimitNotice('已写入 ' + parsed.limit + '，正在确认生效状态…');
+            else setLimitError('写入未生效：配置可能已在别处更新，请重试');
+          }, function (failure) {
+            setLimitNotice('');
+            setLimitError('写入失败：' + (failure !== null && failure !== undefined && failure.message
+              ? failure.message : String(failure)));
           });
         }
 
@@ -959,10 +1082,24 @@ window.__ModuleLoader__.load({
                 h('p', { className: 'fsx-eyebrow' }, 'AGENT TEAM'),
                 h('h1', { className: 'fsx-title' }, '强制委派'))),
             h('span', { className: 'fsx-chip fsx-chip--' + chip.tone },
-              h('span', { className: 'fsx-dot', 'aria-hidden': 'true' }), chip.text)),
+              h('span', { className: 'fsx-dot', 'aria-hidden': 'true' }), chip.text),
+            h('button', {
+              type: 'button', className: 'fsx-exit',
+              'aria-label': '退出强制委派面板，返回当前会话',
+              onClick: closePanel,
+            },
+            h('svg', {
+              width: 14, height: 14, viewBox: '0 0 14 14', fill: 'none',
+              'aria-hidden': 'true', focusable: 'false',
+            }, h('path', {
+              d: 'M8.6 3.6 5.2 7l3.4 3.4',
+              stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round',
+            })),
+            '退出')),
           h('p', { className: 'fsx-subtitle' },
             '按工作区设置成员与子代理的模型路由；保存后对该工作区的新会话同样生效。'),
           banner,
+          h('div', { className: 'fsx-cards' },
           h('section', { className: 'fsx-card' },
             h('div', { className: 'fsx-card-head' },
               h('h2', { className: 'fsx-card-title' }, '工作区配置'),
@@ -972,10 +1109,11 @@ window.__ModuleLoader__.load({
             memberOptions, inherited.member, 'memberProvider', 'memberModel'),
           renderRouteCard('子代理模型', '普通 subagent 使用的模型路由',
             subagentOptions, inherited.subagent, 'subagentProvider', 'subagentModel'),
-          renderSelect('fsx-mode', '委派模式', 'A：成员可派子代理；B：只用成员，成员不再派子代理。', mode,
-            editable !== true,
-            [h('option', { value: 'nested' }, '成员可派子代理'), h('option', { value: 'flat' }, '仅用成员（不派子代理）')],
-            function (next) { setMode(next); resetFeedback(); }),
+          h('section', { className: 'fsx-card fsx-field' },
+            renderSelect('fsx-mode', '委派模式', 'A：成员可派子代理；B：只用成员，成员不再派子代理。', mode,
+              editable !== true,
+              [h('option', { value: 'nested' }, '成员可派子代理'), h('option', { value: 'flat' }, '仅用成员（不派子代理）')],
+              function (next) { setMode(next); resetFeedback(); })),
           h('section', { className: 'fsx-card fsx-switch-row' },
             h('div', { className: 'fsx-switch-copy' },
               h('label', { className: 'fsx-card-title', htmlFor: 'fsx-enabled' }, '启用强制委派提示（全局）'),
@@ -985,6 +1123,28 @@ window.__ModuleLoader__.load({
               checked: enabled === true, disabled: editable !== true,
               onChange: function (event) { setEnabled(event.target.checked === true); resetFeedback(); },
             })),
+          h('section', { className: 'fsx-card fsx-field' },
+            h('label', { className: 'fsx-label', htmlFor: 'fsx-member-limit' }, '团队成员上限'),
+            h('p', { className: 'fsx-hint', id: 'fsx-member-limit-hint' },
+              '「应用上限」经宿主写进 ~/.dsh/cordis.patch.yml 的 agent-team 条目并尝试即时改写运行时；当前值与生效状态取自宿主回读（服务 / home-patch / profile-patch / default），不显示 Config 默认值。'),
+            memberLimitStatus === null
+              ? h('p', { className: 'fsx-hint', role: 'status' }, '当前上限尚未从宿主读取；写入一次后这里显示宿主回读的真实来源与生效状态。')
+              : h('p', { className: 'fsx-feedback', role: 'status' }, memberLimitStatus.text),
+            h('div', { className: 'fsx-savebar' },
+              h('input', {
+                id: 'fsx-member-limit', className: 'fsx-input', type: 'number',
+                min: 1, max: MEMBER_LIMIT_MAX, step: 1, inputMode: 'numeric',
+                value: limitInput, 'aria-describedby': 'fsx-member-limit-hint',
+                onChange: function (event) {
+                  setLimitInput(event.target.value);
+                  setLimitNotice('');
+                  setLimitError('');
+                },
+              }),
+              h('button', { type: 'button', className: 'fsx-primary', disabled: snapshot.status !== 'ready' || busy === true, onClick: applyMemberLimit }, '应用上限'),
+              limitNotice === '' ? null : h('p', { className: 'fsx-feedback fsx-feedback--ok', role: 'status' }, limitNotice),
+              limitError === '' ? null : h('p', { className: 'fsx-feedback fsx-feedback--error', role: 'alert' }, limitError))),
+          ), // .fsx-cards
           h('div', { className: 'fsx-savebar' },
             h('button', {
               type: 'button', className: 'fsx-primary', disabled: canSave !== true, onClick: save,
@@ -1059,6 +1219,8 @@ window.__ModuleLoader__.load({
         buildSaveOperations: buildSaveOperations,
         buildWorkspacesMutation: buildWorkspacesMutation,
         draftIsValid: draftIsValid,
+        parseMemberLimit: parseMemberLimit,
+        memberLimitStatusText: memberLimitStatusText,
         providerGroupOf: providerGroupOf,
         routeOf: routeOf,
         routeText: routeText,
