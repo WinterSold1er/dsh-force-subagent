@@ -1,8 +1,8 @@
 /**
- * dsh-force-subagent wait_agent 空转拦截测试。
+ * dsh-force-subagent wait_agent 空转门禁测试（task-22 起为软门禁）。
  * 契约（权威）：
  *   判据 = 本 turn（事件里最后一个 turn/start 之后）里最后一个 tool/call 的工具名是 wait_agent
- *   （排除本次调用自身：宿主在钩子前已写入该事件）→ deny（相邻两次 wait_agent 之间没有任何有效动作）；其余情况放行。
+ *   （排除本次调用自身：宿主在钩子前已写入该事件）→ 放行 + 投递一次提醒（相邻两次 wait_agent 之间没有任何有效动作）；其余情况放行且不提醒。
  *   fail-open：readEvents 抛错 → 放行且 warn 恰好一次。
  *   真实 apply(ctx) 登记的门禁处理器，不 mock 处理器自身。
  */
@@ -55,17 +55,24 @@ const toolCall = (name, callId) => ({ type: 'tool/call', data: { name, callId } 
  */
 const currentCall = (name) => toolCall(name, `call-${name}`)
 
-/** Lead 会话：真实形状只暴露 snapshotEvents()；tryMembership 未命中。 */
-const leadAgent = (events) => ({
-  id: 'lead-1',
-  session: { snapshotEvents: () => events },
-})
+/** Lead 会话：真实形状只暴露 snapshotEvents()；tryMembership 未命中。notices/inject 复刻宿主 Agent 的 notice 投递通道，供软门禁提醒断言。 */
+const leadAgent = (events) => {
+  const agent = {
+    id: 'lead-1',
+    session: { snapshotEvents: () => events },
+    notices: [],
+    inject(message) { this.notices.push(message) },
+  }
+  return agent
+}
 const leadHost = () => createHost({ agentTeams: { tryMembership: () => undefined } })
 
 /** 成员会话：真实 TeamMembership 形状，root.session 是 Lead 会话。 */
 const teammateAgent = (leadEvents, ownEvents) => ({
   id: 'mate-1',
   session: { snapshotEvents: () => ownEvents },
+  notices: [],
+  inject(message) { this.notices.push(message) },
   membership: {
     role: 'teammate',
     id: 'team-1',
@@ -127,8 +134,8 @@ async function assertAllowed(t, host, tool, agent, label) {
   assert.equal(nextCalls, 1, `${label} / ${tool}：放行路径 next 必须恰好 1 次，实际 ${nextCalls}`)
 }
 
-/** deny 判据：不抛异常、next 0 次、reason 命中 hint 正则。 */
-async function assertDenied(t, host, tool, agent, label, hint) {
+/** 软门禁判据（task-22 新口径）：不抛异常、无 deny、next 恰好 1 次（工具照常执行），且提醒恰好投递一次并命中 hint。 */
+async function assertReminded(t, host, tool, agent, label, hint) {
   const handlers = gateHandlers(host)
   assert.ok(handlers.length >= 1, `${label} / ${tool}：apply 未注册 ${GATE_EVENT} 处理器`)
   const { decisions, threw, nextCalls } = await gateOutcome(host, execOf(tool, agent))
@@ -137,13 +144,19 @@ async function assertDenied(t, host, tool, agent, label, hint) {
     undefined,
     `${label} / ${tool}：门禁处理器不得抛异常，实际抛出：${threw instanceof Error ? threw.message : String(threw)}`,
   )
-  const denied = decisions.filter((decision) => decision?.kind === 'deny')
-  assert.equal(denied.length, 1, `${label} / ${tool}：必须恰好 deny 一次，实际 ${JSON.stringify(decisions)}`)
-  assert.equal(nextCalls, 0, `${label} / ${tool}：deny 路径不得调用 next，实际 ${nextCalls} 次`)
-  const reason = denied[0].reason
-  assert.equal(typeof reason, 'string', `${label} / ${tool}：deny 的 reason 必须是 string`)
-  assert.ok(reason.length > 0, `${label} / ${tool}：deny 的 reason 不得为空串`)
-  assert.match(reason, hint, `${label} / ${tool}：reason 必须命中「${hint}」，实际为「${reason}」`)
+  assert.equal(
+    decisions.filter((decision) => decision?.kind === 'deny').length,
+    0,
+    `${label} / ${tool}：软门禁不得 deny，实际 ${JSON.stringify(decisions)}`,
+  )
+  assert.equal(nextCalls, 1, `${label} / ${tool}：放行路径 next 必须恰好 1 次，实际 ${nextCalls}`)
+  const notices = agent?.notices ?? []
+  assert.equal(notices.length, 1, `${label} / ${tool}：必须恰好投递一条软门禁提醒，实际 ${notices.length} 条`)
+  const text = notices[0]?.content?.[0]?.text ?? ''
+  assert.equal(typeof text, 'string', `${label} / ${tool}：提醒正文必须是 string`)
+  assert.ok(text.length > 0, `${label} / ${tool}：提醒正文不得为空串`)
+  assert.equal(notices[0]?.source?.form, 'notice', `${label} / ${tool}：提醒必须走 notice 通道，实际 ${JSON.stringify(notices[0]?.source)}`)
+  assert.match(text, hint, `${label} / ${tool}：提醒必须命中「${hint}」，实际为「${text}」`)
 }
 
 test('W1 非 wait_agent 工具：不受空转拦截影响，next 恰好 1 次', async (t) => {
@@ -160,11 +173,11 @@ test('W2 本 turn 第一次 wait_agent：放行（next 1 次）', async (t) => {
   await assertAllowed(t, host, 'wait_agent', agent, 'W2 本轮首次 wait_agent')
 })
 
-test('W3 紧邻第二次 wait_agent：deny（next 0 次，理由点名 list_agents / team_task_list）', async (t) => {
+test('W3 紧邻第二次 wait_agent：放行 + 提醒一次（点名 list_agents / team_task_list）', async (t) => {
   const host = leadHost()
   apply(host.ctx)
   const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('wait_agent', 'call-prev-wait'), currentCall('wait_agent')])
-  await assertDenied(
+  await assertReminded(
     t,
     host,
     'wait_agent',
@@ -208,7 +221,7 @@ test('W6 事件含当前调用自身、本 turn 无更早 wait_agent：放行（
   await assertAllowed(t, host, 'wait_agent', agent, 'W6 事件含当前调用自身')
 })
 
-test('W7 当前调用自身 + 更早一条不同 callId 的 wait_agent 且中间无其他工具：deny（next 0 次）', async (t) => {
+test('W7 当前调用自身 + 更早一条不同 callId 的 wait_agent 且中间无其他工具：放行 + 提醒一次', async (t) => {
   const host = leadHost()
   apply(host.ctx)
   const agent = leadAgent([
@@ -217,7 +230,7 @@ test('W7 当前调用自身 + 更早一条不同 callId 的 wait_agent 且中间
     toolCall('wait_agent', 'call-prev-wait'),
     currentCall('wait_agent'),
   ])
-  await assertDenied(
+  await assertReminded(
     t,
     host,
     'wait_agent',

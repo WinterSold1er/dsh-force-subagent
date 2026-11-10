@@ -4,8 +4,8 @@
  * - 缺省 / 空串 / null → 'nested'；只有字符串 'flat' 算 flat；其它非法取值 warn 一次后按 'nested'。
  * - flat 成员提示词整段替换：含 flat 关键词与五个被禁委派工具名，不含 nested 关键句、不含字面量 team_task_create。
  * - flat Lead 提示词追加软踢出段：逐条成员消息先判定完成，完成即 interrupt_agent + team_task_update，之后不再 send_message / 不复用；并写明宿主没有删除成员的 API。
- * - flat 门禁：成员调 subagent / subagent_fork / subagent_role / close_subagent / workflow 一律 deny 且 next 未被调用；成员调 write / edit / bash 放行（next 恰好一次）。
- * - nested 门禁口径不回归：成员调 subagent 放行、调 bash deny。
+ * - flat 门禁（task-22 软门禁口径）：成员调 subagent / subagent_fork / subagent_role / close_subagent / workflow 放行 + 提醒一次（next 恰好一次）；成员调 write / edit / bash 放行且不提醒。
+ * - nested 门禁口径不回归：成员调 subagent 放行不提醒、调 bash 放行但提醒一次。
  * 脚手架沿用 tests/member-gate-deny.test.js（真实监听器 + next 计数）与 tests/force-subagent.test.js（section 捕获）。
  * 运行：node --test tests/mode-flat.test.js
  */
@@ -66,6 +66,8 @@ const runEvent = (args) => ({ type: 'command/run', data: { name: COMMAND_NAME, a
 /** 真实 TeamMembership 形状：role + root.session（Lead 会话），成员自身会话没有 command/run 记录。 */
 const teammateAgent = (leadArgs) => ({
   session: { events: [] },
+  notices: [],
+  inject(message) { this.notices.push(message) },
   membership: { role: 'teammate', id: 'team-1', name: 'worker-1', root: { session: { events: [runEvent(leadArgs)] } } },
 })
 
@@ -176,51 +178,64 @@ test('C) 实时配置优先：settings.describe() 的 mode 覆盖 apply 时的�
   const text = sectionText(host, teammateAgent('on'))
   assert.match(text, /flat 模式/, '实时 mode=flat 必须生效为 flat 提示词')
   assert.doesNotMatch(text, /第一个业务工具调用必须是委派/)
-  const { decisions, threw, nextCalls } = await gateOutcome(host, execOf('subagent', teammateAgent('on')))
+  const agent = teammateAgent('on')
+  const { decisions, threw, nextCalls } = await gateOutcome(host, execOf('subagent', agent))
   assert.equal(threw, undefined)
-  assert.equal(decisions.filter((d) => d?.kind === 'deny').length, 1, '实时 flat 下成员委派必须 deny')
-  assert.equal(nextCalls, 0, 'flat deny 后不得再调用 next')
+  assert.equal(decisions.filter((d) => d?.kind === 'deny').length, 0, '实时 flat 下成员委派不得 deny')
+  assert.equal(nextCalls, 1, 'flat 放行必须调用 next 一次')
+  assert.equal(agent.notices.length, 1, '实时 flat 下成员委派必须投递一条提醒')
+  assert.match(agent.notices[0]?.content?.[0]?.text ?? '', /flat 模式/, '提醒必须点明 flat 模式')
 })
 
-test('D) flat 门禁：成员调五个委派工具一律 deny 且 next 未被调用', async () => {
+test('D) flat 门禁：成员调五个委派工具一律放行 + 提醒一次（文案点明 flat 模式与自己执行）', async () => {
   for (const tool of DELEGATION_TOOLS) {
     const host = memberHost()
     apply(host.ctx, { mode: 'flat' })
-    const { decisions, threw, nextCalls } = await gateOutcome(host, execOf(tool, teammateAgent('on')))
+    const agent = teammateAgent('on')
+    const { decisions, threw, nextCalls } = await gateOutcome(host, execOf(tool, agent))
     assert.equal(threw, undefined, `${tool}：flat 门禁不得抛异常，实际：${threw instanceof Error ? threw.message : String(threw)}`)
-    const denied = decisions.filter((decision) => decision?.kind === 'deny')
-    assert.equal(denied.length, 1, `${tool}：flat 模式下成员委派必须 deny，实际 decisions=${JSON.stringify(decisions)}`)
-    assert.match(denied[0].reason, /flat 模式/, `${tool}：deny 文案必须点明 flat 模式`)
-    assert.match(denied[0].reason, /自己执行/, `${tool}：deny 文案必须要求成员自己执行`)
-    assert.equal(nextCalls, 0, `${tool}：deny 路径不得调用 next，实际 ${nextCalls} 次`)
+    assert.equal(decisions.filter((decision) => decision?.kind === 'deny').length, 0, `${tool}：flat 模式下成员委派不得 deny，实际 decisions=${JSON.stringify(decisions)}`)
+    assert.equal(nextCalls, 1, `${tool}：放行路径必须恰好调用 next 一次，实际 ${nextCalls} 次`)
+    assert.equal(agent.notices.length, 1, `${tool}：必须恰好投递一条提醒，实际 ${agent.notices.length} 条`)
+    const text = agent.notices[0]?.content?.[0]?.text ?? ''
+    assert.match(text, /flat 模式/, `${tool}：提醒文案必须点明 flat 模式`)
+    assert.match(text, /自己执行/, `${tool}：提醒文案必须要求成员自己执行`)
+    assert.match(text, new RegExp(`「${tool}」`), `${tool}：提醒文案必须点名被劝阻的工具`)
   }
 })
 
-test('E) flat 门禁：成员的 write / edit / bash / read 一律放行，next 恰好一次', async () => {
+test('E) flat 门禁：成员的 write / edit / bash / read 一律放行且不提醒，next 恰好一次', async () => {
   for (const tool of ['write', 'edit', 'bash', 'read', 'grep', 'glob', 'todo_write']) {
     const host = memberHost()
     apply(host.ctx, { mode: 'flat' })
-    const { decisions, threw, nextCalls } = await gateOutcome(host, execOf(tool, teammateAgent('on')))
+    const agent = teammateAgent('on')
+    const { decisions, threw, nextCalls } = await gateOutcome(host, execOf(tool, agent))
     assert.equal(threw, undefined, `${tool}：flat 门禁不得抛异常，实际：${threw instanceof Error ? threw.message : String(threw)}`)
     assert.equal(decisions.filter((decision) => decision?.kind === 'deny').length, 0, `${tool}：flat 模式成员自己执行的工具不得 deny，实际 ${JSON.stringify(decisions)}`)
     assert.equal(nextCalls, 1, `${tool}：放行路径必须恰好调用 next 一次，实际 ${nextCalls} 次`)
+    assert.equal(agent.notices.length, 0, `${tool}：flat 下成员自己执行的工具不得投递提醒`)
   }
 })
 
-test('G) nested 口径不回归：成员 subagent 放行、bash deny', async () => {
+test('G) nested 口径不回归：成员 subagent 放行不提醒、成员 bash 放行但提醒一次', async () => {
   const nested = memberHost()
   apply(nested.ctx)
-  const allow = await gateOutcome(nested, execOf('subagent', teammateAgent('on')))
+  const allowAgent = teammateAgent('on')
+  const allow = await gateOutcome(nested, execOf('subagent', allowAgent))
   assert.equal(allow.threw, undefined)
   assert.equal(allow.decisions.filter((d) => d?.kind === 'deny').length, 0, 'nested 下成员委派不得 deny')
   assert.equal(allow.nextCalls, 1, `nested 放行必须恰好调用 next 一次，实际 ${allow.nextCalls} 次`)
+  assert.equal(allowAgent.notices.length, 0, 'nested 下成员委派不得提醒')
 
   const denyHost = memberHost()
   apply(denyHost.ctx)
-  const denied = await gateOutcome(denyHost, execOf('bash', teammateAgent('on')))
-  assert.equal(denied.threw, undefined)
-  assert.equal(denied.decisions.filter((d) => d?.kind === 'deny').length, 1, 'nested 下成员执行类工具必须仍 deny（白名单口径未被 flat 改动破坏）')
-  assert.equal(denied.nextCalls, 0, `nested deny 路径不得调用 next，实际 ${denied.nextCalls} 次`)
+  const remindAgent = teammateAgent('on')
+  const reminded = await gateOutcome(denyHost, execOf('bash', remindAgent))
+  assert.equal(reminded.threw, undefined)
+  assert.equal(reminded.decisions.filter((d) => d?.kind === 'deny').length, 0, 'nested 下成员执行类工具不得 deny（软门禁口径）')
+  assert.equal(reminded.nextCalls, 1, `nested 放行必须调用 next 一次，实际 ${reminded.nextCalls} 次`)
+  assert.equal(remindAgent.notices.length, 1, 'nested 下成员执行类工具必须提醒一次')
+  assert.match(remindAgent.notices[0]?.content?.[0]?.text ?? '', /(委派|subagent)/, '提醒必须给出委派解法')
 })
 
 test('H) 非法 mode=flat 拼错（bogus）：门禁与提示词都按 nested 处理', async () => {
@@ -229,11 +244,15 @@ test('H) 非法 mode=flat 拼错（bogus）：门禁与提示词都按 nested �
   const text = sectionText(host, teammateAgent('on'))
   assert.match(text, /第一个业务工具调用必须是委派/, '非法 mode 必须回退 nested 提示词')
   assert.doesNotMatch(text, /flat 模式/, '非法 mode 不得产出 flat 提示词')
-  const allow = await gateOutcome(host, execOf('subagent', teammateAgent('on')))
+  const allowAgent = teammateAgent('on')
+  const allow = await gateOutcome(host, execOf('subagent', allowAgent))
   assert.equal(allow.nextCalls, 1, '非法 mode 下成员委派仍按 nested 放行')
-  const denied = await gateOutcome(host, execOf('bash', teammateAgent('on')))
-  assert.equal(denied.decisions.filter((d) => d?.kind === 'deny').length, 1, '非法 mode 下成员执行类工具仍按 nested deny')
-  assert.equal(denied.nextCalls, 0)
+  assert.equal(allowAgent.notices.length, 0, '非法 mode 回退 nested 后委派不得提醒')
+  const bashAgent = teammateAgent('on')
+  const reminded = await gateOutcome(host, execOf('bash', bashAgent))
+  assert.equal(reminded.decisions.filter((d) => d?.kind === 'deny').length, 0, '非法 mode 下成员执行类工具按 nested 放行')
+  assert.equal(reminded.nextCalls, 1, '非法 mode 下成员执行类工具必须调用 next')
+  assert.equal(bashAgent.notices.length, 1, '非法 mode 回退 nested 后执行类工具必须提醒一次')
 })
 
 test('I) 模式只影响成员侧委派口径，Lead 取证门禁与 flat 无关的放行不变', async () => {

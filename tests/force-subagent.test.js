@@ -75,7 +75,7 @@ test('apply 注册命令与 systemPrompt section，声明 inject、不监听 age
   assert.ok(section.order >= 0 && section.order <= 999)
   assert.equal(typeof section.text, 'function')
 
-  assert.equal(host.commands.registered.length, 1)
+  assert.deepEqual(host.commands.registered.map((item) => item.name), ['using-agent-team', 'team-limit'], '本插件的两个命令都必须注册且各一次')
   const definition = host.commands.registered[0]
   assert.equal(definition.name, 'using-agent-team')
   assert.match(definition.description, /Agent-Team 强制委派/)
@@ -265,8 +265,13 @@ test('成员：Lead 会话读取异常 → warn 且不注入', () => {
 })
 
 test('命令撞名 already registered：warn 含命令名与修复步骤，section 仍注册', () => {
+  const others = []
   const conflicting = {
-    register() {
+    register(definition) {
+      if (definition.name !== 'using-agent-team') {
+        others.push(definition.name)
+        return
+      }
       throw new Error('command "using-agent-team" is already registered (for a per-agent variant, mount a command-injected plugin under that agent\'s `agent.ctx`)')
     },
   }
@@ -278,6 +283,7 @@ test('命令撞名 already registered：warn 含命令名与修复步骤，secti
   assert.match(host.warnings[0], /dsh-plugin-subagent-director/)
   assert.match(host.warnings[0], /升级/)
   assert.equal(host.systemPrompt.sections.length, 1, '命令失败不得阻断 systemPrompt 注册')
+  assert.deepEqual(others, ['team-limit'], '撞名只影响 using-agent-team，另一个命令照常注册')
 })
 
 test('命令注册的其它错误必须原样抛出，不得吞掉', () => {
@@ -297,7 +303,7 @@ test('systemPrompt.section 撞名 already registered：warn 含 section 名，�
 
   assert.equal(host.warnings.length, 1)
   assert.match(host.warnings[0], /force-subagent:agent-team/)
-  assert.equal(host.commands.registered.length, 1, 'section 失败不得阻断命令注册')
+  assert.equal(host.commands.registered.filter((item) => item.name === 'using-agent-team').length, 1, 'section 失败不得阻断命令注册')
   assert.equal(host.commands.registered[0].name, 'using-agent-team')
   assert.equal(host.commands.registered[0].handler({ rawInput: 'on' }).kind, 'success')
 })

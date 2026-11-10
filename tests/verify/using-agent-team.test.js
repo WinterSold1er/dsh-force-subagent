@@ -101,7 +101,13 @@ function harness() {
 async function boot() {
   const h = harness()
   await apply(h.ctx)
-  assert.equal(h.commands.length, 1, '必须恰注册一个命令')
+  assert.deepEqual(
+    h.commands.map((definition) => definition.name),
+    ['using-agent-team', 'team-limit'],
+    '本插件的两个命令都必须注册且各一次',
+  )
+  // 本套用例只针对 /using-agent-team，把 harness 收窄成它自己。
+  h.commands = h.commands.filter((definition) => definition.name === NAME)
   assert.equal(h.sections.length, 1, '必须恰注册一个 systemPrompt section')
   assert.equal(h.sections[0].name, SECTION, 'section 名必须稳定')
   assert.equal(typeof h.sections[0].text, 'function', 'section.text 必须是 context 函数')

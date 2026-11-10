@@ -5,10 +5,10 @@
  * 门禁生效条件 = membership.root.session 的最后一次 command/run（using-agent-team）事件 args 非 off；
  * 生效时白名单（subagent / subagent_fork / subagent_role / close_subagent / workflow / team_task 系列 /
  * send_message / wait_agent / list_agents / interrupt_agent / job 系列 / skill / todo_write / read / grep / glob）
- * 之外的一切工具必须 deny。
- * deny 断言口径：decision.kind === 'deny'、reason 为 string 且含「委派」或「subagent」、next 未被调用（nextCalls === 0）。
- * 边界断言口径：不得 deny，且 next 恰好被调用一次。
- * 与 tests/member-gate-allow.test.js 互补：那边测「不该 deny 的确实不 deny」，本文件测「该 deny 的确实 deny 且真拦住」。
+ * 之外的一切工具一律被判定越界，但按 task-22 的软门禁口径：工具调用照常放行，另投递一条模型可见提醒。
+ * 提醒断言口径：无 deny、next 恰好一次（nextCalls === 1）、agent.notices 恰好 1 条、正文点名工具名且含「委派」或「subagent」。
+ * 边界断言口径：不得 deny，next 恰好被调用一次，且不投递提醒。
+ * 与 tests/member-gate-allow.test.js 互补：那边测「不该触发提醒的确实不触发」，本文件测「该提醒的确实提醒且工具仍成功」。
  * 运行：node --test tests/member-gate-deny.test.js
  */
 import test from 'node:test'
@@ -21,7 +21,7 @@ const { apply } = plugin
 const GATE_EVENT = 'tools/pre-execute'
 const COMMAND_NAME = 'using-agent-team'
 
-/** 白名单外必须 deny 的工具（执行类与对外副作用类）。 */
+/** 白名单外会被判定越界并触发提醒的工具（执行类与对外副作用类）。 */
 const DENY_TOOLS = [
   'bash',
   'edit',
@@ -79,6 +79,8 @@ const membershipOf = (role, args) => ({
 const agentOf = (membership) => ({
   session: { snapshotEvents: () => [] },
   membership,
+  notices: [],
+  inject(message) { this.notices.push(message) },
 })
 
 const memberHost = (membership) =>
@@ -120,7 +122,7 @@ const stringify = (value) => {
   }
 }
 
-test(`契约：apply 注册 ${GATE_EVENT} 处理器（deny 断言的前提）`, () => {
+test(`契约：apply 注册 ${GATE_EVENT} 处理器（提醒断言的前提）`, () => {
   const host = memberHost(membershipOf('teammate', 'on'))
   apply(host.ctx)
   const handlers = gateHandlers(host)
@@ -133,43 +135,48 @@ test(`契约：apply 注册 ${GATE_EVENT} 处理器（deny 断言的前提）`, 
   }
 })
 
-test('deny 组：teammate + Lead 非 off 时，白名单外工具必须 deny 且不调用 next', async (t) => {
+test('提醒组：teammate + Lead 非 off 时，白名单外工具放行（next 一次）并投递一条点名工具的提醒', async (t) => {
   for (const tool of DENY_TOOLS) {
     await t.test(tool, async () => {
       const host = memberHost(membershipOf('teammate', 'on'))
       apply(host.ctx)
-      const { decisions, threw, nextCalls } = await gateOutcome(
-        host,
-        execOf(tool, agentOf(membershipOf('teammate', 'on'))),
-      )
+      const agent = agentOf(membershipOf('teammate', 'on'))
+      const { decisions, threw, nextCalls } = await gateOutcome(host, execOf(tool, agent))
       assert.equal(
         threw,
         undefined,
         `${tool}：门禁处理器不得抛异常，实际抛出：${threw instanceof Error ? threw.message : String(threw)}`,
       )
-      const denied = decisions.filter((decision) => decision?.kind === 'deny')
-      assert.ok(denied.length >= 1, `${tool}：成员门禁未 deny（默认拒绝白名单未生效），处理器返回：${stringify(decisions)}`)
-      for (const decision of denied) {
-        assert.equal(typeof decision.reason, 'string', `${tool}：deny 的 reason 必须是 string，实际 ${typeof decision.reason}（${stringify(decision.reason)}）`)
-        assert.match(decision.reason, /(委派|subagent)/, `${tool}：reason 必须说明委派/subagent 要求，实际为「${decision.reason}」`)
-      }
-      assert.equal(nextCalls, 0, `${tool}：deny 路径不得调用 next（既 deny 又 next = 拦截未生效），实际 next 被调用 ${nextCalls} 次`)
+      assert.equal(
+        decisions.filter((decision) => decision?.kind === 'deny').length,
+        0,
+        `${tool}：软门禁不得 deny（默认拒绝白名单已改为放行+提醒），处理器返回：${stringify(decisions)}`,
+      )
+      assert.equal(nextCalls, 1, `${tool}：放行路径必须恰好调用 next 一次，实际 ${nextCalls} 次`)
+      assert.equal(agent.notices.length, 1, `${tool}：必须恰好投递一条软门禁提醒，实际 ${agent.notices.length} 条`)
+      const text = agent.notices[0]?.content?.[0]?.text ?? ''
+      assert.equal(agent.notices[0]?.source?.form, 'notice', `${tool}：提醒必须走 notice 通道，实际 ${stringify(agent.notices[0]?.source)}`)
+      assert.match(text, new RegExp(`「${tool}」`), `${tool}：提醒必须点名被劝阻的工具，实际为「${text}」`)
+      assert.match(text, /(委派|subagent)/, `${tool}：提醒必须说明委派/subagent 要求，实际为「${text}」`)
     })
   }
 })
 
-test('deny 组：Lead 命令记录 args 的非 off 变体同样 deny（无参数、大写、其它开法）', async (t) => {
+test('提醒组：Lead 命令记录 args 的非 off 变体同样提醒（无参数、大写、其它开法）', async (t) => {
   for (const args of [undefined, 'on', 'ON', 'enable', '  on  ']) {
     await t.test(`args=${stringify(args)}`, async () => {
       const membership = membershipOf('teammate', args)
       const host = memberHost(membership)
       apply(host.ctx)
-      const { decisions, nextCalls } = await gateOutcome(host, execOf('bash', agentOf(membership)))
-      assert.ok(
-        decisions.some((decision) => decision?.kind === 'deny'),
-        `args=${stringify(args)}：非 off 必须 deny bash，处理器返回：${stringify(decisions)}`,
+      const agent = agentOf(membership)
+      const { decisions, nextCalls } = await gateOutcome(host, execOf('bash', agent))
+      assert.equal(
+        decisions.filter((decision) => decision?.kind === 'deny').length,
+        0,
+        `args=${stringify(args)}：非 off 不得 deny bash，处理器返回：${stringify(decisions)}`,
       )
-      assert.equal(nextCalls, 0, `args=${stringify(args)}：deny 路径调用了 next ${nextCalls} 次`)
+      assert.equal(nextCalls, 1, `args=${stringify(args)}：放行路径 next 必须恰好一次，实际 ${nextCalls} 次`)
+      assert.equal(agent.notices.length, 1, `args=${stringify(args)}：必须恰好投递一条提醒，实际 ${agent.notices.length} 条`)
     })
   }
 })
@@ -210,6 +217,7 @@ test('边界组：门禁不成立时不得 deny，且 next 恰好一次', async 
           assert.notStrictEqual(decision?.kind, 'deny', `${label} / ${tool}：不得 deny，处理器 #${index + 1} 返回 ${stringify(decision)}`)
         }
         assert.equal(nextCalls, 1, `${label} / ${tool}：放行路径必须恰好调用 next 一次，实际 ${nextCalls} 次`)
+        assert.equal(agent.notices?.length ?? 0, 0, `${label} / ${tool}：门禁不成立时不得投递提醒，实际 ${agent.notices?.length ?? 0} 条`)
       }
     })
   }
