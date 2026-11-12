@@ -3,7 +3,7 @@
  * 契约：提醒去重令牌 = 会话事件里最后一个 turn/start 的下标（index.js 的 `lead-evidence:${turnStart}`）。
  *   T1 同一轮连续两次命中只提醒一次；
  *   T2 新的 turn/start（新的用户消息开新一轮）之后重新提醒一次，累计 2 条 —— 本文件核心；
- *   T3 本轮已经 spawn_teammate 派发 → 命中工具放行且不提醒（同时充当 T1 / T2 的反例，证明断言不是恒真）；
+ *   T3 本轮已经 subagent 派发 → 命中工具放行且不提醒（同时充当 T1 / T2 的反例，证明断言不是恒真）；
  *   T4 源码断言：index.js 中 kind: 'deny' 出现 0 次，插件不返回任何拒绝结果；
  *   T5 17 个点名工具（取证 8 + 实现 4 + 执行 5）逐个：同轮内放行 + 恰好一次提醒。
  * 夹具与 tests/lead-gate-bypass-tools.test.js 同一口径：真实 Session 只暴露 snapshotEvents()，
@@ -138,7 +138,7 @@ test('T2 新的 turn/start 之后再 bash：重新提醒一次（累计 2 条）
   assert.equal(agent.notices.length, 2, `T2：同一轮内换工具不得刷新提醒，实际 ${agent.notices.length} 条`)
 })
 
-test('T3 本轮已 spawn_teammate 派发：命中工具放行且不提醒', async () => {
+test('T3 本轮已 subagent 派发：命中工具放行且不提醒', async () => {
   const { host, agent } = leadFixture([runEvent('on'), turnStart(1), toolCall('team_task_create'), toolCall('spawn_teammate')])
   for (const tool of ['bash', 'write', 'run_code']) await assertAllowed(host, tool, agent, `T3 ${tool}`)
   assert.equal(agent.notices.length, 0, `T3：本轮已派发不得投递提醒，实际 ${agent.notices.length} 条`)
@@ -173,7 +173,7 @@ test('T5 17 个点名工具逐个（取证 8 + 实现 4 + 执行 5）：同轮�
         assert.equal(agent.notices.length, 1, `T5 / ${tool}：同轮内必须恰好一次提醒，实际 ${agent.notices.length} 条`)
         const reminder = reminderText(agent.notices[0])
         assert.match(reminder, new RegExp(`「${tool}」`), `T5 / ${tool}：提醒必须点名该工具，实际「${reminder}」`)
-        assert.match(reminder, /team_task_create[\s\S]*spawn_teammate/, `T5 / ${tool}：提醒必须给出 team_task_create → spawn_teammate 出路，实际「${reminder}」`)
+        assert.match(reminder, /team_task_create[\s\S]*subagent/, `T5 / ${tool}：提醒必须给出 team_task_create → subagent 出路，实际「${reminder}」`)
         assert.deepEqual(host.warnings, [], `T5 / ${tool}：不得产生 fail-open warn，实际：${JSON.stringify(host.warnings)}`)
       })
     }

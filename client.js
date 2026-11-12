@@ -27,6 +27,10 @@ window.__ModuleLoader__.load({
     var ENTRY = 'dsh-force-subagent';
     var PANEL = 'dsh-force-subagent';
     var POLICY_NS = 'subagent-model-selection-settings';
+    // rc.2 的成员容量与嵌套深度不在本插件命名空间：宿主旋钮在 `subagent` 服务条目（与 index.js CAPACITY_NS 同源）。
+    var CAPACITY_NS = 'subagent';
+    var CAPACITY_LIMIT_KEY = 'maxActiveSubagents';
+    var CAPACITY_DEPTH_KEY = 'maxDepth';
     var STYLE_ID = 'dsh-force-subagent-style';
 
     // 当前绑定的 sessionId：两个会话入口共用，页面订阅它。
@@ -217,6 +221,56 @@ window.__ModuleLoader__.load({
       return next;
     }
 
+    /** 可写入的工作区键：按枚举顺序去重；解析不出键的条目直接跳过，绝不默认落到某个工作区。 */
+    function enumerableWorkspaceKeys(items) {
+      var list = Array.isArray(items) ? items : [];
+      var keys = [];
+      list.forEach(function (item) {
+        var key = workspaceKeyOf(item);
+        if (key !== undefined && keys.indexOf(key) < 0) keys.push(key);
+      });
+      return keys;
+    }
+
+    /**
+     * 「保存设置到所有工作区」的 workspaces 字典，与 buildWorkspacesMutation 同构：
+     * 整表浅拷贝（不修改入参），既有条目与条目上的其它字段原样保留；
+     * 再把当前 draft 的 member / subagent 路由广播到枚举出的每个工作区键，
+     * 返回「既有键 ∪ 枚举键」的并集。
+     */
+    function buildAllWorkspacesMutation(currentWorkspaces, items, draft) {
+      var source = isObject(currentWorkspaces) ? currentWorkspaces : {};
+      var next = {};
+      Object.keys(source).forEach(function (name) { next[name] = source[name]; });
+      var route = routeOf(draft && { provider: draft.memberProvider, model: draft.memberModel });
+      var subagent = routeOf(draft && { provider: draft.subagentProvider, model: draft.subagentModel });
+      enumerableWorkspaceKeys(items).forEach(function (key) {
+        var existing = isObject(source[key]) ? source[key] : {};
+        var record = {};
+        Object.keys(existing).forEach(function (name) { record[name] = existing[name]; });
+        record.member = { provider: route.provider, model: route.model };
+        record.subagent = { provider: subagent.provider, model: subagent.model };
+        next[key] = record;
+      });
+      return next;
+    }
+
+    /** 宿主没有声明 mode 时的取值；与插件侧 DEFAULT_CONFIG.mode 同值，面板里所有 mode 兜底只认这一个来源。 */
+    var DEFAULT_MODE = 'nested';
+
+    /**
+     * 从宿主配置读全局字段（enabled / mode）的真值：enabled 只认严格 true；
+     * mode 与插件侧 normalizeMode 同口径——只有 'flat' / 'nested' 是有效取值，缺失或非法一律 DEFAULT_MODE。
+     * 面板的显示初值、同步兜底、未同步时的写入兜底都只经这一个来源，绝不凭空造默认值。
+     */
+    function hostGlobalsOf(value) {
+      var source = isObject(value) ? value : {};
+      return {
+        enabled: source.enabled === true,
+        mode: source.mode === 'flat' || source.mode === 'nested' ? source.mode : DEFAULT_MODE,
+      };
+    }
+
     /** 保存载荷：enabled / workspaces 两个必发 set op，加 mode 这个可选 set op（仅取 nested|flat，未提供则不写该字段）。revision 围栏由调用方 form.mutate(ops, revision) 传入。 */
     function buildSaveOperations(currentWorkspaces, key, draft, enabled, mode) {
       var operations = [
@@ -239,46 +293,64 @@ window.__ModuleLoader__.load({
       });
     }
 
-    /** 成员上限护栏，与宿主侧 index.js:464 `MAX_MEMBER_LIMIT = 1000` 对齐（宿主默认 16）。 */
-    var MEMBER_LIMIT_MAX = 1000;
+    /** 成员容量护栏，与宿主侧 index.js `MAX_CAPACITY_LIMIT` 对齐（真正的执行上限由宿主 subagent 服务持有）。 */
+    var MEMBER_LIMIT_MAX = 100000;
 
-    /** 成员上限校验：只接受 1..MEMBER_LIMIT_MAX 的十进制正整数，其它一律就地拒绝并说明收到了什么。 */
+    /** 成员容量校验：只接受 1..MEMBER_LIMIT_MAX 的十进制正整数，其它一律就地拒绝并说明收到了什么。 */
     function parseMemberLimit(value) {
       var raw = typeof value === 'number' ? String(value)
         : typeof value === 'string' ? value.trim() : '';
       if (!/^\d+$/.test(raw)) {
         return {
           ok: false,
-          error: '成员上限必须是 1–' + MEMBER_LIMIT_MAX + ' 的正整数（收到“' + (raw === '' ? '空' : raw) + '”）。',
+          error: '成员容量必须是 1–' + MEMBER_LIMIT_MAX + ' 的正整数（收到“' + (raw === '' ? '空' : raw) + '”）。',
         };
       }
       var numeric = Number(raw);
       if (numeric < 1 || numeric > MEMBER_LIMIT_MAX) {
-        return { ok: false, error: '成员上限必须在 1–' + MEMBER_LIMIT_MAX + ' 之间（收到 ' + raw + '）。' };
+        return { ok: false, error: '成员容量必须在 1–' + MEMBER_LIMIT_MAX + ' 之间（收到 ' + raw + '）。' };
       }
       return { ok: true, limit: numeric };
     }
 
     /**
-     * 把宿主回写的 maxMembersStatus 映射为面板文案（纯函数，暴露给测试）。
-     * 状态一律来自宿主回读（readMemberLimit 的真实来源），绝不用 Config 默认值冒充当前值。
-     * applied：即时生效；restart-required：已持久化但需重启；loaded：载入时读到的当前真值；error：宿主失败原文。
+     * 把 `subagent` 命名空间快照映射为面板文案（纯函数，暴露给测试）。
+     * 只报宿主当前值：快照没就绪或没有该字段就返回 null，由卡片显示「尚未从宿主读取」，不用默认值冒充当前值。
      */
-    function memberLimitStatusText(status) {
-      if (!isObject(status)) return null;
-      if (status.state === 'applied') {
-        return { tone: 'ok', text: '已即时生效（当前 ' + status.limit + '，来源：' + status.source + '）。' };
+    function capacityStatusText(snapshot) {
+      if (!isObject(snapshot) || snapshot.status !== 'ready' || !isObject(snapshot.value)) return null;
+      var limit = snapshot.value[CAPACITY_LIMIT_KEY];
+      if (typeof limit !== 'number' || !isFinite(limit)) return null;
+      var depth = snapshot.value[CAPACITY_DEPTH_KEY];
+      var depthText = typeof depth === 'number' && isFinite(depth) ? '，嵌套深度上限 ' + depth : '';
+      return { tone: 'ok', text: '当前 ' + limit + depthText + '（来源：' + CAPACITY_NS + ' 服务，写入即持久化并即时生效）。' };
+    }
+
+    /** 从 `subagent` 命名空间快照里取出容量与深度的当前值；读不到为 null。 */
+    function parseCapacitySnapshot(snapshot) {
+      if (!isObject(snapshot) || snapshot.status !== 'ready' || !isObject(snapshot.value)) {
+        return { limit: null, depth: null };
       }
-      if (status.state === 'restart-required') {
-        return { tone: 'warn', text: '已写入 ' + status.requested + '，需重启宿主才生效（当前运行时 ' + status.limit + '，来源：' + status.source + '）。' };
+      var limit = snapshot.value[CAPACITY_LIMIT_KEY];
+      var depth = snapshot.value[CAPACITY_DEPTH_KEY];
+      return {
+        limit: typeof limit === 'number' && isFinite(limit) ? limit : null,
+        depth: typeof depth === 'number' && isFinite(depth) ? depth : null,
+      };
+    }
+
+    /** 嵌套深度校验：只接受 0..MEMBER_LIMIT_MAX 的十进制整数；nested 模式需要 ≥ 2 才能让成员再派子代理。 */
+    function parseDepthLimit(value) {
+      var raw = typeof value === 'string' ? value.trim() : String(value === null || value === undefined ? '' : value);
+      if (raw === '') return { ok: false, error: '嵌套深度必须是 0–' + MEMBER_LIMIT_MAX + ' 的整数（收到空值）。' };
+      if (!/^\+?\d+$/.test(raw)) {
+        return { ok: false, error: '嵌套深度必须是 0–' + MEMBER_LIMIT_MAX + ' 的整数（收到“' + raw + '”）。' };
       }
-      if (status.state === 'loaded') {
-        return { tone: 'ok', text: '当前 ' + status.limit + '（来源：' + status.source + '）。' };
+      var numeric = Number(raw);
+      if (numeric < 0 || numeric > MEMBER_LIMIT_MAX) {
+        return { ok: false, error: '嵌套深度必须在 0–' + MEMBER_LIMIT_MAX + ' 之间（收到 ' + raw + '）。' };
       }
-      if (status.state === 'error') {
-        return { tone: 'error', text: status.message || '成员上限写入失败。' };
-      }
-      return null;
+      return { ok: true, depth: numeric };
     }
 
     function policyRoutes(snapshot) {
@@ -447,6 +519,11 @@ window.__ModuleLoader__.load({
       '.fsx-primary:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover,#2a2a2e);}',
       '.fsx-primary:active:not(:disabled){transform:translateY(1px);}',
       '.fsx-primary:disabled{opacity:.45;cursor:not-allowed;}',
+      /* 次要按钮与 .fsx-primary 同尺寸同手感，只换成面板已有的描边/卡片 token，不新增颜色字面量。 */
+      '.fsx-secondary{min-height:44px;padding:0 18px;border:1px solid var(--fsx-stroke);border-radius:var(--dsw-radius-sm,8px);background:var(--fsx-card);color:var(--fsx-text);font:inherit;font-size:13px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:8px;transition:background 160ms var(--ds-ease-in-out,ease),border-color 160ms var(--ds-ease-in-out,ease),transform 120ms var(--ds-ease-in-out,ease),opacity 160ms;}',
+      '.fsx-secondary:hover:not(:disabled){background:var(--fsx-hover);border-color:var(--fsx-accent);}',
+      '.fsx-secondary:active:not(:disabled){transform:translateY(1px);}',
+      '.fsx-secondary:disabled{opacity:.45;cursor:not-allowed;}',
       '.fsx-feedback{margin:0;font-size:12px;line-height:18px;}',
       '.fsx-feedback--ok{color:var(--fsx-muted);}',
       '.fsx-feedback--error{color:var(--fsx-err);}',
@@ -525,6 +602,20 @@ window.__ModuleLoader__.load({
       }
       if (form === null || form === undefined || typeof form.getSnapshot !== 'function') {
         form = {
+          getSnapshot: function () { return { status: 'unavailable', value: null, revision: 0, writable: false }; },
+          subscribe: function () { return function () {}; },
+          mutate: function () { return Promise.resolve(false); },
+        };
+      }
+
+      var capacityScope;
+      try {
+        capacityScope = ctx.configForms.get(CAPACITY_NS);
+      } catch (error) {
+        capacityScope = null;
+      }
+      if (capacityScope === null || capacityScope === undefined || typeof capacityScope.getSnapshot !== 'function') {
+        capacityScope = {
           getSnapshot: function () { return { status: 'unavailable', value: null, revision: 0, writable: false }; },
           subscribe: function () { return function () {}; },
           mutate: function () { return Promise.resolve(false); },
@@ -751,6 +842,7 @@ window.__ModuleLoader__.load({
 
         var snapshot = useScopeSnapshot(form);
         var policySnapshot = useScopeSnapshot(policyScope);
+        var capacitySnapshot = useScopeSnapshot(capacityScope);
         var workspaceState = useWorkspaceItems();
         var workspaces = workspaceState.items;
         var workspaceError = workspaceState.error;
@@ -763,10 +855,13 @@ window.__ModuleLoader__.load({
           memberProvider: '', memberModel: '', subagentProvider: '', subagentModel: '',
         });
         var draft = draftState[0], setDraft = draftState[1];
-        var enabledState = React.useState(true);
+        var hostGlobals = hostGlobalsOf(snapshot.value);
+        var enabledState = React.useState(hostGlobals.enabled);
         var enabled = enabledState[0], setEnabled = enabledState[1];
-        var modeState = React.useState('nested');
+        var modeState = React.useState(hostGlobals.mode);
         var mode = modeState[0], setMode = modeState[1];
+        /** enabled / mode 是否已经从宿主同步过：快照一就绪初值就是宿主真值，所以初值跟随 status。 */
+        var globalsSyncedRef = React.useRef(snapshot.status === 'ready');
         var busyState = React.useState(false);
         var busy = busyState[0], setBusy = busyState[1];
         var noticeState = React.useState('');
@@ -775,12 +870,16 @@ window.__ModuleLoader__.load({
         var error = errorState[0], setError = errorState[1];
         var limitInputState = React.useState('');
         var limitInput = limitInputState[0], setLimitInput = limitInputState[1];
+        var depthInputState = React.useState('');
+        var depthInput = depthInputState[0], setDepthInput = depthInputState[1];
         var limitNoticeState = React.useState('');
         var limitNotice = limitNoticeState[0], setLimitNotice = limitNoticeState[1];
         var limitErrorState = React.useState('');
         var limitError = limitErrorState[0], setLimitError = limitErrorState[1];
 
         var itemsVersion = workspaces.map(function (item) { return workspaceKeyOf(item) || ''; }).join('\u0001');
+        var allWorkspaceKeys = enumerableWorkspaceKeys(workspaces);
+        var globalsVersion = (hostGlobals.enabled ? '1' : '0') + '\u0001' + hostGlobals.mode;
 
         React.useEffect(function () {
           if (bound !== null && bound !== undefined) {
@@ -796,11 +895,23 @@ window.__ModuleLoader__.load({
           setSelectedKey(null);
         }, [bound, itemsVersion]);
 
+        /**
+         * 全局字段（enabled / mode）的同步：只以宿主快照就绪为条件，不受 selectedKey 门控。
+         * 全局开关与委派模式不属于任何工作区，快照一就绪就该显示宿主真值而不是灰态占位；
+         * 是否允许写入由 canSave / canSaveAll 的 selectedKey 门禁决定，这里只负责「显示的是宿主真值」。
+         */
+        React.useEffect(function () {
+          if (snapshot.status !== 'ready') return;
+          var host = hostGlobalsOf(snapshot.value);
+          setEnabled(host.enabled);
+          setMode(host.mode);
+          globalsSyncedRef.current = true;
+        }, [globalsVersion, snapshot.revision, snapshot.status]);
+
+        /** 工作区路由 draft：仍保持选中门控——未选中时保持空 draft（保存时继承默认），不替用户挑工作区。 */
         React.useEffect(function () {
           if (snapshot.status !== 'ready' || selectedKey === null || selectedKey === undefined) return;
           setDraft(buildDraft(workspacesRecordOf(snapshot.value), selectedKey));
-          setEnabled(isObject(snapshot.value) && snapshot.value.enabled === true);
-          setMode(isObject(snapshot.value) && typeof snapshot.value.mode === 'string' ? snapshot.value.mode : 'nested');
         }, [selectedKey, snapshot.revision, snapshot.status]);
 
         var value = isObject(snapshot.value) ? snapshot.value : {};
@@ -816,10 +927,20 @@ window.__ModuleLoader__.load({
         } });
 
         var editable = snapshot.status === 'ready' && selectedKey !== null && selectedKey !== undefined && busy !== true;
+        /** 全局开关与委派模式不属于某个工作区：快照就绪就可编辑，未选中时也必须显示宿主真值而不是灰态占位。 */
+        var globalsEditable = snapshot.status === 'ready' && busy !== true;
         var valid = draftIsValid(draft);
         var canSave = editable && valid;
+        /** 广播也必须先选中工作区：要写进各工作区的模型路由就是选中那个工作区 draft 里的，未选中就没有可广播的路由。
+         * `allWorkspaceKeys.length > 0` 是纵深防御，UI 上目前走不到：工作区被清空时上面的 useEffect 会把 selectedKey 归 null，
+         * canSave 已经先为 false 了。留着它是因为 canSave 并不直接依赖枚举结果，一旦两者解耦（入口 bound 兜底、列表与选中状态不同步），
+         * 这道护栏仍能挡住「没有任何工作区可写」的广播。行为不变，只是不依赖上游巧合。 */
+        var canSaveAll = canSave && allWorkspaceKeys.length > 0;
 
-        var memberLimitStatus = memberLimitStatusText(isObject(snapshot.value) ? snapshot.value.maxMembersStatus : null);
+        var capacityValues = parseCapacitySnapshot(capacitySnapshot);
+        var memberLimitStatus = capacityStatusText(capacitySnapshot);
+        var depthNeeded = snapshot.status === 'ready' && isObject(snapshot.value) && snapshot.value.mode === 'nested'
+          && capacityValues.depth !== null && capacityValues.depth < 2;
 
         var chip = { tone: 'ok', text: '已就绪' };
         if (snapshot.status === 'loading') chip = { tone: 'warn', text: '加载中' };
@@ -833,6 +954,31 @@ window.__ModuleLoader__.load({
         function resetFeedback() {
           setNotice('');
           setError('');
+        }
+
+        /** 失败提示：先清掉上一条成功提示，notice 与 error 不会同时挂在面板上。 */
+        function showFailure(message) {
+          setNotice('');
+          setError(message);
+        }
+
+        /** 成功提示：先清掉上一条错误提示（包括写入期间再点按钮落下的「保存中…」）。 */
+        function showSuccess(message) {
+          setError('');
+          setNotice(message);
+        }
+
+        /**
+         * 写入用的全局字段取值：已经从宿主同步过就用面板当前值；还没同步过（快照刚就绪、同步 effect
+         * 尚未跑到的窗口）就取宿主刚读到的真值并回填面板，绝不把 useState 的初值当成用户设置写进配置。
+         */
+        function resolveGlobalFields(freshValue) {
+          if (globalsSyncedRef.current === true) return { enabled: enabled === true, mode: mode };
+          var host = hostGlobalsOf(freshValue);
+          globalsSyncedRef.current = true;
+          setEnabled(host.enabled);
+          setMode(host.mode);
+          return host;
         }
 
         function selectWorkspace(event) {
@@ -867,28 +1013,50 @@ window.__ModuleLoader__.load({
         }
 
         /**
-         * 成员上限「应用」：真写入。经 ctx.configForms.get(ENTRY).mutate 写 maxMembers（Config 已带 volatile 字段），
-         * 宿主写进 profile patch 后由插件接回 setMemberLimit 完成持久化 + 运行时改写。
-         * 非法值就地拦截、零调用；成功后的真实来源与生效状态由 subscribe 更新的 maxMembersStatus 呈现；失败显示宿主原文。
+         * 成员容量「应用」：真写入。经 ctx.configForms.get('subagent').mutate 写 maxActiveSubagents（宿主 volatile 字段），
+         * 宿主持久化进 profile 层 patch 并即时生效；深度输入非空时一并写 maxDepth。
+         * 非法值就地拦截、零调用；取值与当前一致时零写入；失败显示宿主原文。
          */
-        function applyMemberLimit() {
+        function applyCapacity() {
           var parsed = parseMemberLimit(limitInput);
           if (!parsed.ok) {
             setLimitNotice('');
             setLimitError(parsed.error);
             return;
           }
-          var fresh = form.getSnapshot();
+          var parsedDepth = null;
+          if (String(depthInput).trim() !== '') {
+            parsedDepth = parseDepthLimit(depthInput);
+            if (!parsedDepth.ok) {
+              setLimitNotice('');
+              setLimitError(parsedDepth.error);
+              return;
+            }
+          }
+          var fresh = capacityScope.getSnapshot();
           if (fresh.status !== 'ready') {
             setLimitNotice('');
-            setLimitError('宿主配置服务不可用或未就绪：' + ENTRY + ' 命名空间状态为 ' + fresh.status + '，无法写入成员上限。');
+            setLimitError('宿主配置服务不可用或未就绪：' + CAPACITY_NS + ' 命名空间状态为 ' + fresh.status + '，无法写入成员容量。');
+            return;
+          }
+          var current = parseCapacitySnapshot(fresh);
+          var operations = [];
+          if (current.limit !== parsed.limit) {
+            operations.push({ op: 'set', path: [CAPACITY_LIMIT_KEY], value: parsed.limit });
+          }
+          if (parsedDepth !== null && current.depth !== parsedDepth.depth) {
+            operations.push({ op: 'set', path: [CAPACITY_DEPTH_KEY], value: parsedDepth.depth });
+          }
+          if (operations.length === 0) {
+            setLimitError('');
+            setLimitNotice('当前已是该取值，无需写入。');
             return;
           }
           setLimitError('');
           setLimitNotice('正在写入 ' + parsed.limit + '…');
           var pending;
           try {
-            pending = form.mutate([{ op: 'set', path: ['maxMembers'], value: parsed.limit }], fresh.revision);
+            pending = capacityScope.mutate(operations, fresh.revision);
           } catch (failure) {
             setLimitNotice('');
             setLimitError('写入失败：' + (failure instanceof Error ? failure.message : String(failure)));
@@ -896,7 +1064,7 @@ window.__ModuleLoader__.load({
           }
           Promise.resolve(pending).then(function (ok) {
             if (ok === true) setLimitNotice('已写入 ' + parsed.limit + '，正在确认生效状态…');
-            else setLimitError('写入未生效：配置可能已在别处更新，请重试');
+            else setLimitError('写入未生效：配置可能已在别处更新，或宿主拒绝覆盖更高优先级的配置层，请重试');
           }, function (failure) {
             setLimitNotice('');
             setLimitError('写入失败：' + (failure !== null && failure !== undefined && failure.message
@@ -908,29 +1076,93 @@ window.__ModuleLoader__.load({
           if (!canSave) return;
           var fresh = form.getSnapshot();
           if (fresh.status !== 'ready') {
-            setError('配置尚未就绪，稍后重试');
+            showFailure('配置尚未就绪，稍后重试');
             return;
           }
           var key = selectedKey;
-          var operations = buildSaveOperations(workspacesRecordOf(fresh.value), key, draft, enabled === true, mode);
+          var globals = resolveGlobalFields(fresh.value);
+          var operations = buildSaveOperations(workspacesRecordOf(fresh.value), key, draft, globals.enabled, globals.mode);
           setBusy(true);
-          setNotice('');
-          setError('');
+          resetFeedback();
           var pending;
           try {
             pending = form.mutate(operations, fresh.revision);
           } catch (failure) {
             setBusy(false);
-            setError('保存失败：' + (failure instanceof Error ? failure.message : String(failure)));
+            showFailure('保存失败：' + (failure instanceof Error ? failure.message : String(failure)));
             return;
           }
           Promise.resolve(pending).then(function (ok) {
             setBusy(false);
-            if (ok === true) setNotice('已保存');
-            else setError('保存未生效：配置可能已在别处更新，请重试');
+            if (ok === true) showSuccess('已保存');
+            else showFailure('保存未生效：配置可能已在别处更新，请重试');
           }, function (failure) {
             setBusy(false);
-            setError('保存失败：' + (failure !== null && failure !== undefined && failure.message
+            showFailure('保存失败：' + (failure !== null && failure !== undefined && failure.message
+              ? failure.message : String(failure)));
+          });
+        }
+
+        /**
+         * 「保存设置到所有工作区」：与 save() 同构，一次 form.mutate（单 revision 围栏，原子写），
+         * 把 enabled / mode 与选中工作区 draft 里的模型路由广播到枚举到的每个工作区；不碰成员容量（容量只由「应用容量」写 subagent 命名空间）。
+         * 全局字段走 resolveGlobalFields：快照刚就绪、同步 effect 尚未跑到的窗口里取宿主刚读到的真值，
+         * 绝不会把面板没同步过的初值广播成全局设置。
+         */
+        function saveAll() {
+          if (selectedKey === null || selectedKey === undefined) {
+            showFailure('请先选择一个工作区，再应用到所有已枚举的工作区');
+            return;
+          }
+          if (busy === true) {
+            showFailure('保存中…，请等待当前写入结束');
+            return;
+          }
+          var fresh;
+          try {
+            fresh = form.getSnapshot();
+          } catch (failure) {
+            showFailure('读取最新配置失败：' + (failure instanceof Error ? failure.message : String(failure)));
+            return;
+          }
+          if (fresh.status !== 'ready') {
+            showFailure('配置尚未就绪，稍后重试');
+            return;
+          }
+          var keys = enumerableWorkspaceKeys(workspaces);
+          if (keys.length === 0) {
+            showFailure(workspaceError !== ''
+              ? '工作区列表不可用：' + workspaceError
+              : '没有找到工作区，无法广播设置。');
+            return;
+          }
+          if (!draftIsValid(draft)) {
+            showFailure('provider 与 model 需成对选择');
+            return;
+          }
+          var globals = resolveGlobalFields(fresh.value);
+          var operations = [
+            { op: 'set', path: ['enabled'], value: globals.enabled },
+            { op: 'set', path: ['workspaces'], value: buildAllWorkspacesMutation(workspacesRecordOf(fresh.value), workspaces, draft) },
+          ];
+          if (globals.mode === 'nested' || globals.mode === 'flat') operations.push({ op: 'set', path: ['mode'], value: globals.mode });
+          setBusy(true);
+          resetFeedback();
+          var pending;
+          try {
+            pending = form.mutate(operations, fresh.revision);
+          } catch (failure) {
+            setBusy(false);
+            showFailure('保存失败：' + (failure instanceof Error ? failure.message : String(failure)));
+            return;
+          }
+          Promise.resolve(pending).then(function (ok) {
+            setBusy(false);
+            if (ok === true) showSuccess('已写入 ' + keys.length + ' 个工作区（并更新全局开关与模式）');
+            else showFailure('保存未生效：配置可能已在别处更新，请重试');
+          }, function (failure) {
+            setBusy(false);
+            showFailure('保存失败：' + (failure !== null && failure !== undefined && failure.message
               ? failure.message : String(failure)));
           });
         }
@@ -1074,6 +1306,23 @@ window.__ModuleLoader__.load({
         else if (!valid) disabledReason = 'provider 与 model 需成对选择';
         else if (busy === true) disabledReason = '保存中…';
 
+        /* 「保存设置到所有工作区」与「保存设置」一样要求先选中工作区：广播的路由来自选中那个工作区的 draft。
+           禁用原因按「用户下一步能做什么」排序：没有任何可枚举的工作区时选择无从谈起，所以先说工作区不可用；
+           有工作区但没选中时才要求选择；配置不可用 / 写入中属于用户无法自行解决的状态，放在具体操作之后。 */
+        var allDisabledReason = '';
+        if (allWorkspaceKeys.length === 0) {
+          allDisabledReason = workspaceError !== '' ? '工作区列表不可用：' + workspaceError : '未发现任何工作区';
+        }
+        else if (selectedKey === null || selectedKey === undefined) allDisabledReason = '请先选择一个工作区，再应用到所有已枚举的工作区';
+        else if (!valid) allDisabledReason = 'provider 与 model 需成对选择';
+        else if (snapshot.status !== 'ready') allDisabledReason = '配置不可用';
+        else if (busy === true) allDisabledReason = '保存中…';
+
+        /* 禁用原因必须在页面上读得到，不能只挂在 title 上：键盘与屏幕阅读器不会播报 title。
+           广播的门槛是单个保存门槛的子集，disabledReason 非空时两个按钮一起禁用，所以复用同一条可见文案；
+           只有「能单个保存、却没有任何可枚举工作区」这条纵深防御分支会让两者不一致，这时改用广播自己的原因。 */
+        var sharedDisabledReason = disabledReason !== '' ? disabledReason : allDisabledReason;
+
         return h('section', { id: PANEL },
           h('header', { className: 'fsx-header' },
             h('div', { className: 'fsx-heading' },
@@ -1111,7 +1360,7 @@ window.__ModuleLoader__.load({
             subagentOptions, inherited.subagent, 'subagentProvider', 'subagentModel'),
           h('section', { className: 'fsx-card fsx-field' },
             renderSelect('fsx-mode', '委派模式', 'A：成员可派子代理；B：只用成员，成员不再派子代理。', mode,
-              editable !== true,
+              globalsEditable !== true,
               [h('option', { value: 'nested' }, '成员可派子代理'), h('option', { value: 'flat' }, '仅用成员（不派子代理）')],
               function (next) { setMode(next); resetFeedback(); })),
           h('section', { className: 'fsx-card fsx-switch-row' },
@@ -1120,41 +1369,64 @@ window.__ModuleLoader__.load({
               h('p', { className: 'fsx-hint' }, '全局开关：关闭后对所有工作区生效，子代理不再套用本页的模型路由；Agent-Team 提示词由 /using-agent-team 命令控制。')),
             h('input', {
               id: 'fsx-enabled', className: 'fsx-checkbox', type: 'checkbox',
-              checked: enabled === true, disabled: editable !== true,
+              checked: enabled === true, disabled: globalsEditable !== true,
               onChange: function (event) { setEnabled(event.target.checked === true); resetFeedback(); },
             })),
           h('section', { className: 'fsx-card fsx-field' },
-            h('label', { className: 'fsx-label', htmlFor: 'fsx-member-limit' }, '团队成员上限'),
+            h('label', { className: 'fsx-label', htmlFor: 'fsx-member-limit' }, '团队成员容量'),
             h('p', { className: 'fsx-hint', id: 'fsx-member-limit-hint' },
-              '「应用上限」经宿主写进 ~/.dsh/cordis.patch.yml 的 agent-team 条目并尝试即时改写运行时；当前值与生效状态取自宿主回读（服务 / home-patch / profile-patch / default），不显示 Config 默认值。'),
+              'rc.2 的成员就是委派树里的 subagent：容量与嵌套深度都由宿主 subagent 服务的 volatile 字段决定。「应用容量」经宿主写进 profile 层 patch 并即时生效；插件不写任何配置文件，也不再写 agent-team 的成员上限（rc.2 的 agent-team 已不接受该键）。'),
             memberLimitStatus === null
-              ? h('p', { className: 'fsx-hint', role: 'status' }, '当前上限尚未从宿主读取；写入一次后这里显示宿主回读的真实来源与生效状态。')
+              ? h('p', { className: 'fsx-hint', role: 'status' }, '当前容量尚未从宿主读取；写入一次后这里显示宿主回读的真实当前值。')
               : h('p', { className: 'fsx-feedback', role: 'status' }, memberLimitStatus.text),
+            depthNeeded
+              ? h('p', { className: 'fsx-feedback fsx-feedback--error', role: 'alert' },
+                '当前模式允许成员派子代理，但宿主嵌套深度上限只有 ' + capacityValues.depth + '：成员再派子代理会被宿主拒绝，请同时写入更大的深度。')
+              : null,
             h('div', { className: 'fsx-savebar' },
               h('input', {
                 id: 'fsx-member-limit', className: 'fsx-input', type: 'number',
                 min: 1, max: MEMBER_LIMIT_MAX, step: 1, inputMode: 'numeric',
                 value: limitInput, 'aria-describedby': 'fsx-member-limit-hint',
+                placeholder: capacityValues.limit === null ? '同时活着的成员数' : String(capacityValues.limit),
                 onChange: function (event) {
                   setLimitInput(event.target.value);
                   setLimitNotice('');
                   setLimitError('');
                 },
               }),
-              h('button', { type: 'button', className: 'fsx-primary', disabled: snapshot.status !== 'ready' || busy === true, onClick: applyMemberLimit }, '应用上限'),
+              h('input', {
+                id: 'fsx-member-depth', className: 'fsx-input', type: 'number',
+                min: 0, max: MEMBER_LIMIT_MAX, step: 1, inputMode: 'numeric',
+                value: depthInput, 'aria-describedby': 'fsx-member-limit-hint',
+                placeholder: capacityValues.depth === null ? '嵌套深度（可选）' : '深度 ' + capacityValues.depth,
+                onChange: function (event) {
+                  setDepthInput(event.target.value);
+                  setLimitNotice('');
+                  setLimitError('');
+                },
+              }),
+              h('button', { type: 'button', className: 'fsx-primary', disabled: capacitySnapshot.status !== 'ready' || busy === true, onClick: applyCapacity }, '应用容量'),
               limitNotice === '' ? null : h('p', { className: 'fsx-feedback fsx-feedback--ok', role: 'status' }, limitNotice),
               limitError === '' ? null : h('p', { className: 'fsx-feedback fsx-feedback--error', role: 'alert' }, limitError))),
           ), // .fsx-cards
           h('div', { className: 'fsx-savebar' },
             h('button', {
-              type: 'button', className: 'fsx-primary', disabled: canSave !== true, onClick: save,
+              id: 'fsx-save', type: 'button', className: 'fsx-primary', disabled: canSave !== true, onClick: save,
               'aria-busy': busy === true,
             },
               busy === true ? h('span', { className: 'fsx-spinner', 'aria-hidden': 'true' }) : null,
               busy === true ? '保存中…' : '保存设置'),
+            h('button', {
+              id: 'fsx-save-all', type: 'button', className: 'fsx-secondary',
+              disabled: canSaveAll !== true,
+              title: allDisabledReason === '' ? '把选中工作区的模型路由与全局开关、模式写入每个已枚举的工作区，没枚举到的条目保持不变' : allDisabledReason,
+              onClick: saveAll,
+            }, '保存设置到所有工作区'),
+            h('p', { className: 'fsx-hint' }, '把选中工作区的模型路由，连同全局开关与委派模式，一次写入所有已枚举的工作区；配置里已有但没枚举到的工作区条目原样保留；成员上限仍是全局单值，请用「应用上限」。'),
             h('p', { className: 'fsx-hint' }, '保存会同时写入全局开关与当前工作区的模型路由。'),
-            disabledReason === '' ? null
-              : h('p', { className: 'fsx-hint' }, disabledReason),
+            sharedDisabledReason === '' ? null
+              : h('p', { className: 'fsx-hint' }, '保存设置与「保存设置到所有工作区」都暂不可用：' + sharedDisabledReason),
             notice === '' ? null : h('p', { className: 'fsx-feedback fsx-feedback--ok', role: 'status' }, notice),
             error === '' ? null : h('p', { className: 'fsx-feedback fsx-feedback--error', role: 'alert' }, error)));
       }
@@ -1218,9 +1490,13 @@ window.__ModuleLoader__.load({
         buildDraft: buildDraft,
         buildSaveOperations: buildSaveOperations,
         buildWorkspacesMutation: buildWorkspacesMutation,
+        buildAllWorkspacesMutation: buildAllWorkspacesMutation,
+        enumerableWorkspaceKeys: enumerableWorkspaceKeys,
         draftIsValid: draftIsValid,
         parseMemberLimit: parseMemberLimit,
-        memberLimitStatusText: memberLimitStatusText,
+        parseDepthLimit: parseDepthLimit,
+        capacityStatusText: capacityStatusText,
+        parseCapacitySnapshot: parseCapacitySnapshot,
         providerGroupOf: providerGroupOf,
         routeOf: routeOf,
         routeText: routeText,

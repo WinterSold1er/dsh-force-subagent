@@ -4,6 +4,8 @@
 
 **路径缩写**（全文声明一次）：`TREE` = `/home/csy/Code/installer/deepseek-harness-0.2.1-rc.3`；`AT` = `packages/experimental/agent-team/src`；`TAT` = `packages/experimental/tool-agent-team/src`；`SP` = `packages/core/system-prompt/src`。其余 `packages/...`、`vendor/...` 路径均相对 `TREE`。
 
+> **版本边界（0.2.2-rc.2 起）**：本文的 `agentTeams.tryMembership` / `TeamMembership` / `team/member` 花名册 / `agent-team.maxMembers` 均为 0.2.2-rc.1 及更早的宿主契约，rc.2 已删除：`tryMembership` 与 `membership` 不再有实现，会话只追加 `team/mode` 与 `team/task`，`agent-team` 的 Config 只剩 `maxTasks` 与 `defaultEnabled`（写入已删除的键会让服务在构造期抛 `TEAM_INVALID_CONFIG`）。插件侧的现行口径见 [README.md](../README.md) 的《宿主版本边界》与 `index.js` 的 `resolveMembership` / `readCapacity`；成员容量改由 `subagent` 服务的 volatile `maxActiveSubagents` 与 `maxDepth` 决定。本文保留作历史取证与注入点分析参考，其中的行号与结论不得当作 rc.2 的现行契约。
+
 ## 当前实现口径：命令门控的 `systemPrompt.section`
 
 `index.js` 现在声明 `export const inject = ['commands', 'systemPrompt', 'subagents']`，在 `apply` 里注册**一个** section 和一个命令、包裹 `subagents.startActivation` 注入子代理模型路由；不挂 `agent/pre-step`、不追加 user 消息、不写自定义会话事件类型：

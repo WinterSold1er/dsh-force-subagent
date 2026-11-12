@@ -250,6 +250,46 @@ function makeEnv(options) {
     subscribe() { return function () {}; },
   };
 
+  // rc.2 的成员容量与嵌套深度住在宿主 `subagent` 命名空间，面板经同一个 configForms 入口读写它。
+  var capacityValue = options.capacity === undefined || options.capacity === null
+    ? { maxActiveSubagents: 8, maxDepth: 2 }
+    : options.capacity.value;
+  var capacityRevision = options.capacity === undefined || options.capacity === null
+    || options.capacity.revision === undefined ? 5 : options.capacity.revision;
+  var capacityMutations = [];
+  var capacitySubs = [];
+  var capacityForm = options.capacity === null ? undefined : {
+    getSnapshot() {
+      return { status: 'ready', value: capacityValue, revision: capacityRevision, writable: true };
+    },
+    subscribe(listener) {
+      capacitySubs.push(listener);
+      return function () {
+        var index = capacitySubs.indexOf(listener);
+        if (index >= 0) capacitySubs.splice(index, 1);
+      };
+    },
+    mutate(operations, revision) {
+      capacityMutations.push({ operations, revision });
+      if (options.capacityReject !== undefined) {
+        var failure = new Error(options.capacityReject);
+        if (options.capacityRejectThrows === true) throw failure;
+        return Promise.reject(failure);
+      }
+      var merged = {};
+      Object.keys(capacityValue === null || capacityValue === undefined ? {} : capacityValue).forEach(function (name) {
+        merged[name] = capacityValue[name];
+      });
+      operations.forEach(function (op) {
+        if (op.op === 'set' && op.path.length === 1) merged[op.path[0]] = op.value;
+      });
+      capacityValue = merged;
+      capacityRevision += 1;
+      capacitySubs.forEach(function (listener) { listener(); });
+      return Promise.resolve(true);
+    },
+  };
+
   var remoteService = {
     session: {
       modelCatalog() { return Promise.resolve(options.catalog); },
@@ -263,6 +303,7 @@ function makeEnv(options) {
         namespaces.push(namespace);
         if (namespace === PANEL_ID) return form;
         if (namespace === POLICY_NS) return policyScope;
+        if (namespace === 'subagent') return capacityForm;
         return undefined;
       },
     },
@@ -308,8 +349,9 @@ function makeEnv(options) {
   var main = entries.filter(function (entry) { return entry.registration.name === 'main'; })[0];
   return {
     react, plugin, entries, ctx, form, main,
-    namespaces, mutations, panelCalls, warns,
+    namespaces, mutations, capacityMutations, panelCalls, warns,
     configValue() { return configValue; },
+    capacityValue() { return capacityValue; },
     panel() { return mount(react, main.component, {}); },
   };
 }
@@ -430,7 +472,7 @@ test('保存走 form.mutate(三个 set op: enabled/workspaces/mode, fresh.revisi
   findById(tree, 'fsx-memberProvider')[0].props.onChange({ target: { value: 'dp' } });
   tree = panel.render();
 
-  const saveButton = findByText(tree, '保存设置', 'button');
+  const saveButton = findById(tree, 'fsx-save');
   assert.equal(saveButton.length, 1);
   assert.equal(typeof saveButton[0].props.onClick, 'function');
   assert.equal(saveButton[0].props.disabled, false);
@@ -474,7 +516,7 @@ test('路由不合法时不提交：provider 有值而 model 为空则保存按�
   tree = panel.render();
   tree = panel.render();
 
-  const saveButton = findByText(tree, '保存设置', 'button');
+  const saveButton = findById(tree, 'fsx-save');
   assert.equal(saveButton.length, 1);
   assert.equal(saveButton[0].props.disabled, true, 'provider/model 不成对时不得允许保存');
   saveButton[0].props.onClick();
@@ -530,7 +572,8 @@ test('三个会话入口注册 id 均为 force-subagent-route，main 用 key、�
     byName['conversation.hero.options'].order,
     byName['sidebar.workspaces.session.menu.item'].order,
   ], [20, 30, 100, 900]);
-  assert.deepEqual(env.namespaces, [PANEL_ID, POLICY_NS], 'apply 必须读自己的配置命名空间与策略命名空间');
+  assert.deepEqual(env.namespaces, [PANEL_ID, 'subagent', POLICY_NS],
+    'apply 必须读自己的配置命名空间、宿主容量命名空间 subagent 与策略命名空间');
 });
 
 test('draftIsValid：成对才为真，半对为假，null 直接抛错（实现无空值防御）', () => {
@@ -663,19 +706,25 @@ test('退出时宿主 selectPanel 抛错不得炸页面，只落 warn', () => {
     '异常必须被记到 warn，不能空 catch 吞掉');
 });
 
-// ---------------------------------------------------------------- 团队成员上限控件
+// ---------------------------------------------------------------- 团队成员容量控件（rc.2：宿主 subagent 命名空间）
 
 const LIMIT_INPUT = 'fsx-member-limit';
+const DEPTH_INPUT = 'fsx-member-depth';
 const LIMIT_CONFIG = { enabled: true, mode: 'nested', workspaces: {} };
+/** 面板默认的宿主 subagent 命名空间快照；深度 2 让 nested 模式默认不触发深度告警。 */
+const CAPACITY_DEFAULT = { maxActiveSubagents: 8, maxDepth: 2 };
 
-function limitEnv() {
-  const env = makeEnv({
-    config: { value: LIMIT_CONFIG, revision: 3 },
+function limitEnv(options) {
+  const opts = options === undefined ? {} : options;
+  return makeEnv({
+    config: { value: opts.config === undefined ? LIMIT_CONFIG : opts.config, revision: 3 },
     policy: { status: 'ready', value: { enabled: false, allowedModels: [] } },
     workspaces: WORKSPACES,
     catalog: CATALOG_OK,
+    capacity: opts.capacity,
+    capacityReject: opts.capacityReject,
+    capacityRejectThrows: opts.capacityRejectThrows,
   });
-  return env;
 }
 
 /** 挂好面板并返回当前树（两次 render 让 effect 真的跑一遍）。 */
@@ -693,182 +742,209 @@ function findByClass(tree, tone) {
 }
 
 function limitApply(tree) {
-  const found = findByText(tree, '应用上限', 'button');
-  assert.equal(found.length, 1, '「应用上限」按钮必须有且只有一个');
+  const found = findByText(tree, '应用容量', 'button');
+  assert.equal(found.length, 1, '「应用容量」按钮必须有且只有一个');
   assert.equal(typeof found[0].props.onClick, 'function', '没有 onClick 的应用按钮就是摆设');
   return found[0];
 }
 
-test('成员上限控件：label、number 输入、应用按钮与来源说明齐备且互相关联', async () => {
-  const { tree } = await limitPanel(limitEnv());
+/** 面板里唯一的容量输入与深度输入：写入只能经由它们触发，不存在第二条写入路径。 */
+function capacityInputs(tree) {
+  const limit = findById(tree, LIMIT_INPUT);
+  const depth = findById(tree, DEPTH_INPUT);
+  assert.equal(limit.length, 1, '容量输入必须唯一');
+  assert.equal(depth.length, 1, '深度输入必须唯一');
+  return { limit: limit[0], depth: depth[0] };
+}
 
-  const inputs = findById(tree, LIMIT_INPUT);
-  assert.equal(inputs.length, 1, '上限输入必须有且只有一个');
-  assert.equal(inputs[0].type, 'input');
-  assert.equal(inputs[0].props.type, 'number');
-  assert.equal(inputs[0].props.min, 1);
-  assert.equal(inputs[0].props.max, 1000);
-  assert.equal(inputs[0].props.step, 1);
-  assert.equal(inputs[0].props.inputMode, 'numeric');
-  assert.equal(typeof inputs[0].props.onChange, 'function');
+/** 填两个输入并点「应用容量」，返回点击后的最新树（React 状态要重渲染才看得到）。 */
+function submitCapacity(panel, tree, limit, depth) {
+  const inputs = capacityInputs(tree);
+  inputs.limit.props.onChange({ target: { value: limit } });
+  capacityInputs(panel.render()).depth.props.onChange({ target: { value: depth === undefined ? '' : depth } });
+  const filled = panel.render();
+  limitApply(filled).props.onClick();
+  return panel.render();
+}
+
+/** 全部宿主写入里出现过的字段名，用于证明插件不再往任何命名空间写 maxMembers。 */
+function writtenPaths(env) {
+  return env.mutations.concat(env.capacityMutations).reduce(function (acc, call) {
+    return acc.concat(call.operations.map(function (op) { return op.path.join('.'); }));
+  }, []);
+}
+
+test('成员容量控件：label、两个 number 输入、应用按钮与来源说明齐备且互相关联', async () => {
+  const env = limitEnv();
+  const { tree } = await limitPanel(env);
+  const inputs = capacityInputs(tree);
+  assert.equal(inputs.limit.props.type, 'number', '容量输入必须是 number');
+  assert.equal(inputs.limit.props.min, 1);
+  assert.equal(inputs.limit.props.max, 100000, '护栏必须与宿主侧 index.js MAX_CAPACITY_LIMIT 一致');
+  assert.equal(inputs.limit.props['aria-describedby'], 'fsx-member-limit-hint', '输入必须指向同一条说明');
+  assert.equal(inputs.depth.props.type, 'number');
+  assert.equal(inputs.depth.props.min, 0, '宿主 maxDepth 的合法下界是 0');
+  assert.equal(inputs.depth.props['aria-describedby'], 'fsx-member-limit-hint');
+  assert.equal(typeof inputs.limit.props.onChange, 'function');
+  assert.equal(typeof inputs.depth.props.onChange, 'function');
 
   const labels = collectNodes(tree).filter(function (node) {
     return node.type === 'label' && node.props.htmlFor === LIMIT_INPUT;
   });
   assert.equal(labels.length, 1, '输入必须有 label，键盘与读屏用户才找得到');
-  assert.ok(textOf(labels[0].children).indexOf('团队成员上限') >= 0);
+  assert.ok(textOf(labels[0].children).indexOf('团队成员容量') >= 0, 'label 必须点名容量：' + textOf(labels[0].children));
 
-  const hintNode = findById(tree, inputs[0].props['aria-describedby']);
-  assert.equal(hintNode.length, 1, 'aria-describedby 必须指向真实存在的说明');
-  const hint = textOf(hintNode[0].children);
-  ['服务', 'home-patch', 'profile-patch', 'default'].forEach(function (source) {
-    assert.ok(hint.indexOf(source) >= 0, '说明必须列出来源 ' + source);
-  });
-
+  const hints = findById(tree, 'fsx-member-limit-hint');
+  assert.equal(hints.length, 1, '说明节点必须唯一');
+  const hint = textOf(hints[0].children);
+  assert.ok(hint.indexOf('subagent') >= 0, '说明必须点名容量所在的宿主命名空间：' + hint);
+  assert.ok(hint.indexOf('即时生效') >= 0, '说明必须交代生效时机：' + hint);
+  assert.ok(hint.indexOf('不写任何配置文件') >= 0, '说明必须写明插件不再写配置文件：' + hint);
   limitApply(tree);
 });
 
-test('成员上限非法值：就地报错、不留成功提示、零宿主调用也不写配置', async () => {
+test('成员容量当前值：面板显示宿主 subagent 命名空间回读的容量与深度，不显示插件默认值', async () => {
+  const env = limitEnv({ capacity: { value: { maxActiveSubagents: 1024, maxDepth: 2 }, revision: 9 } });
+  const { tree } = await limitPanel(env);
+  const status = findByClass(tree, 'fsx-feedback').filter(function (node) {
+    return node.props.role === 'status' && textOf(node.children).indexOf('当前 ') >= 0;
+  });
+  assert.equal(status.length, 1, '必须恰好一条当前容量状态：' + status.map(function (n) { return textOf(n.children); }));
+  const text = textOf(status[0].children);
+  assert.ok(text.indexOf('1024') >= 0, '当前容量必须来自宿主快照：' + text);
+  assert.ok(text.indexOf('嵌套深度上限 2') >= 0, '深度同样要回读自宿主：' + text);
+  const inputs = capacityInputs(tree);
+  assert.equal(inputs.limit.props.placeholder, '1024', '输入占位符必须显示宿主当前值');
+  assert.equal(inputs.depth.props.placeholder, '深度 2');
+});
+
+test('成员容量非法值：就地报错、不留成功提示、零宿主写入也不改配置', async () => {
   const env = limitEnv();
   const { panel, tree } = await limitPanel(env);
-  let current = tree;
-
-  ['', '   ', '0', '-3', '1.5', '1001', 'abc', '1e3', '0x10', '１０', '12,5'].forEach(function (raw) {
-    findById(current, LIMIT_INPUT)[0].props.onChange({ target: { value: raw } });
-    current = panel.render();
-    limitApply(current).props.onClick();
-    current = panel.render();
-
+  ['', '   ', '0', '-3', '1.5', '100001', 'abc', '1e3', '0x10', '１０', '12,5'].forEach(function (raw) {
+    const current = submitCapacity(panel, tree, raw);
     const errors = findByClass(current, 'fsx-feedback--error');
-    assert.equal(errors.length, 1, '非法值 ' + JSON.stringify(raw) + ' 必须落一条就地提示');
+    assert.equal(errors.length, 1, '非法值 ' + JSON.stringify(raw) + ' 必须落一条就地提示：' + textOf(errors[0].children));
     assert.equal(errors[0].props.role, 'alert', '就地提示必须是 alert，读屏才播报');
     const message = textOf(errors[0].children);
-    assert.ok(message.indexOf('成员上限') >= 0, '提示必须点名是哪个字段：' + message);
+    assert.ok(message.indexOf('成员容量') >= 0, '提示必须点名是哪个字段：' + message);
     assert.ok(message.indexOf('收到') >= 0, '提示必须说明收到了什么：' + message);
     assert.equal(findByClass(current, 'fsx-feedback--ok').length, 0, '非法值不得同时冒充成功反馈');
   });
-
-  assert.equal(env.mutations.length, 0, '非法值不得产生任何宿主写入');
-  assert.equal(env.namespaces.filter(function (ns) { return ns !== PANEL_ID && ns !== POLICY_NS; }).length, 0,
-    '校验失败不得去碰任何新的宿主命名空间');
-  assert.deepEqual(env.configValue(), LIMIT_CONFIG, '非法值不得改动配置');
+  assert.equal(env.capacityMutations.length, 0, '非法值不得产生任何宿主写入');
+  assert.equal(env.mutations.length, 0, '非法值不得去碰插件自己的命名空间');
+  assert.deepEqual(env.capacityValue(), CAPACITY_DEFAULT, '非法值不得改动容量配置');
+  assert.deepEqual(env.configValue(), LIMIT_CONFIG, '非法值不得改动插件配置');
 });
 
-test('成员上限合法值：经 configForms 真的写入 maxMembers，写载荷与 revision 围栏都对', async () => {
+test('成员容量合法值：经 configForms 写入 subagent 命名空间的 maxActiveSubagents，载荷与 revision 围栏都对', async () => {
   const env = limitEnv();
   const { panel, tree } = await limitPanel(env);
-
-  findById(tree, LIMIT_INPUT)[0].props.onChange({ target: { value: '64' } });
-  const after = panel.render();
-  limitApply(after).props.onClick();
+  submitCapacity(panel, tree, '64');
   await settle();
-  const done = panel.render();
-
-  assert.equal(env.mutations.length, 1, '合法值必须真的发一次宿主写入，而不是只给命令');
-  const call = env.mutations[0];
-  assert.equal(call.operations.length, 1, '只发一条 maxMembers 写入');
-  assert.equal(call.operations[0].op, 'set', 'op 必须是 set');
-  assert.equal(call.operations[0].path.length, 1, '写路径必须只有一个段');
-  assert.equal(call.operations[0].path[0], 'maxMembers', '写路径必须点名 maxMembers');
-  assert.equal(call.operations[0].value, 64, '写载荷必须带数值');
-  assert.equal(typeof call.revision, 'number', '必须带 revision 围栏');
-  assert.equal(env.configValue().maxMembers, 64, '写入必须落到配置');
-  assert.equal(findByClass(done, 'fsx-feedback--error').length, 0, '成功不得落 error');
+  assert.equal(env.capacityMutations.length, 1, '合法值必须真的发一次宿主写入');
+  const call = env.capacityMutations[0];
+  assert.equal(call.operations.length, 1, '只填容量时只发一条写入');
+  assert.equal(call.operations[0].path[0], 'maxActiveSubagents', '写路径必须点名宿主的容量字段');
+  assert.equal(call.operations[0].value, 64);
+  assert.equal(call.revision, 5, '必须带读取快照的 revision 作围栏');
+  assert.equal(env.mutations.length, 0, '容量写入不得落到插件自己的命名空间');
+  assert.deepEqual(writtenPaths(env), ['maxActiveSubagents'], '整条写入链不得出现别的字段：' + writtenPaths(env).join(','));
+  assert.equal(env.capacityValue().maxActiveSubagents, 64, '写入必须落到容量配置');
+  assert.equal(env.configValue().maxMembers, undefined, '插件命名空间里不存在 maxMembers');
 });
 
-test('成员上限即时生效态：宿主回写 applied 时面板显示即时生效与真实来源', async () => {
-  const env = makeEnv({
-    config: { value: { enabled: true, mode: 'nested', workspaces: {}, maxMembers: 64,
-      maxMembersStatus: { state: 'applied', requested: 64, limit: 64, source: 'service', message: '' } }, revision: 3 },
-    policy: { status: 'ready', value: { enabled: false, allowedModels: [] } },
-    workspaces: WORKSPACES,
-    catalog: CATALOG_OK,
-  });
+test('成员容量与深度同写：填了深度就两条 op，留空就只写容量', async () => {
+  const withDepth = limitEnv();
+  const first = await limitPanel(withDepth);
+  submitCapacity(first.panel, first.tree, '64', '3');
+  await settle();
+  assert.equal(withDepth.capacityMutations.length, 1);
+  assert.deepEqual(plain(withDepth.capacityMutations[0].operations.map(function (op) { return op.path[0]; })),
+    ['maxActiveSubagents', 'maxDepth'], '深度输入非空必须一并写入');
+  assert.equal(withDepth.capacityValue().maxDepth, 3);
+
+  const withoutDepth = limitEnv();
+  const second = await limitPanel(withoutDepth);
+  submitCapacity(second.panel, second.tree, '64', '');
+  await settle();
+  assert.deepEqual(plain(withoutDepth.capacityMutations[0].operations.map(function (op) { return op.path[0]; })),
+    ['maxActiveSubagents'], '深度留空不得改动宿主 maxDepth');
+  assert.equal(withoutDepth.capacityValue().maxDepth, 2, '未填深度时宿主深度保持不变');
+});
+
+test('成员容量与宿主当前值相同：零写入并说明无需写入', async () => {
+  const env = limitEnv({ capacity: { value: { maxActiveSubagents: 64, maxDepth: 2 }, revision: 4 } });
   const { panel, tree } = await limitPanel(env);
-  findById(tree, LIMIT_INPUT)[0].props.onChange({ target: { value: '64' } });
-  const done = panel.render();
-
-  const status = collectNodes(done).filter(function (node) {
-    return (node.props.className || '').indexOf('fsx-feedback') >= 0
-      && textOf(node.children).indexOf('已即时生效') >= 0;
-  });
-  assert.equal(status.length, 1, 'applied 状态必须显示即时生效');
-  assert.equal(status[0].props.role, 'status');
-  const text = textOf(status[0].children);
-  assert.ok(text.indexOf('来源：service') >= 0, '必须显示真实来源，不得用 Config 默认值冒充：' + text);
+  const current = submitCapacity(panel, tree, '64', '2');
+  await settle();
+  assert.equal(env.capacityMutations.length, 0, '与当前值一致时不得写宿主');
+  const ok = findByClass(current, 'fsx-feedback--ok');
+  assert.equal(ok.length, 1, '必须给出一条「无需写入」说明');
+  assert.ok(textOf(ok[0].children).indexOf('无需写入') >= 0, textOf(ok[0].children));
 });
 
-test('成员上限需重启态：宿主回写 restart-required 时面板显示需重启并区分写入值/运行时值', async () => {
-  const env = makeEnv({
-    config: { value: { enabled: true, mode: 'nested', workspaces: {}, maxMembers: 24,
-      maxMembersStatus: { state: 'restart-required', requested: 24, limit: 16, source: 'home-patch', message: '' } }, revision: 3 },
-    policy: { status: 'ready', value: { enabled: false, allowedModels: [] } },
-    workspaces: WORKSPACES,
-    catalog: CATALOG_OK,
+test('nested 模式深度不足：面板点名宿主深度上限并给出后果，flat 模式不给该告警', async () => {
+  const nested = limitEnv({ capacity: { value: { maxActiveSubagents: 8, maxDepth: 1 }, revision: 4 } });
+  const nestedTree = (await limitPanel(nested)).tree;
+  const alerts = findByClass(nestedTree, 'fsx-feedback--error').filter(function (node) {
+    return node.props.role === 'alert';
   });
+  assert.equal(alerts.length, 1, 'nested + 深度 1 必须恰好一条深度告警');
+  const message = textOf(alerts[0].children);
+  assert.ok(message.indexOf('嵌套深度上限只有 1') >= 0, message);
+  assert.ok(message.indexOf('拒绝') >= 0, '告警必须说明后果：' + message);
+
+  const flat = limitEnv({
+    config: { enabled: true, mode: 'flat', workspaces: {} },
+    capacity: { value: { maxActiveSubagents: 8, maxDepth: 1 }, revision: 4 },
+  });
+  const flatTree = (await limitPanel(flat)).tree;
+  assert.equal(findByClass(flatTree, 'fsx-feedback--error').filter(function (node) {
+    return node.props.role === 'alert';
+  }).length, 0, 'flat 模式不派子代理，不得出现深度告警');
+});
+
+test('成员容量失败态：宿主拒绝写入(mutate 拒绝)时贴出宿主原文且配置不被改', async () => {
+  const env = limitEnv({ capacityReject: 'Config field "maxActiveSubagents" is not volatile' });
+  const { panel, tree } = await limitPanel(env);
+  submitCapacity(panel, tree, '12');
+  await settle();
+  const current = panel.render();
+  const errors = findByClass(current, 'fsx-feedback--error');
+  assert.equal(errors.length, 1, '宿主拒绝写入必须只给一条错误');
+  const message = textOf(errors[0].children);
+  assert.ok(message.indexOf('maxActiveSubagents') >= 0 && message.indexOf('is not volatile') >= 0,
+    '必须贴出宿主原文：' + message);
+  assert.equal(env.capacityValue().maxActiveSubagents, 8, '宿主拒绝写入时容量配置不得被改');
+});
+
+test('成员容量失败态：mutate 同步抛错同样落到错误文案，不冒泡炸面板', async () => {
+  const env = limitEnv({ capacityReject: 'home patch 覆盖该字段，写入被拒绝', capacityRejectThrows: true });
+  const { panel, tree } = await limitPanel(env);
+  submitCapacity(panel, tree, '12');
+  await settle();
+  const current = panel.render();
+  const errors = findByClass(current, 'fsx-feedback--error');
+  assert.equal(errors.length, 1);
+  assert.ok(textOf(errors[0].children).indexOf('home patch 覆盖该字段') >= 0, textOf(errors[0].children));
+});
+
+test('成员容量失败态：宿主没有 subagent 命名空间时按钮禁用并说明尚未读取', async () => {
+  const env = limitEnv({ capacity: null });
   const { tree } = await limitPanel(env);
-  const done = tree;
-
-  const status = collectNodes(done).filter(function (node) {
-    return (node.props.className || '').indexOf('fsx-feedback') >= 0
-      && textOf(node.children).indexOf('需重启') >= 0;
-  });
-  assert.equal(status.length, 1, 'restart-required 状态必须显示需重启');
-  const text = textOf(status[0].children);
-  assert.ok(text.indexOf('已写入 24') >= 0, '必须显示写入值：' + text);
-  assert.ok(text.indexOf('当前运行时 16') >= 0, '必须区分当前运行时值：' + text);
-  assert.ok(text.indexOf('home-patch') >= 0, '必须显示真实来源：' + text);
+  const apply = limitApply(tree);
+  assert.equal(apply.props.disabled, true, '命名空间不可用时不得允许写入');
+  assert.equal(env.capacityMutations.length, 0, '命名空间不可用时不得发起写入');
+  const hints = findByClass(tree, 'fsx-hint').filter(function (node) { return node.props.role === 'status'; });
+  assert.equal(hints.length, 1);
+  assert.ok(textOf(hints[0].children).indexOf('尚未从宿主读取') >= 0, textOf(hints[0].children));
 });
 
-test('成员上限失败态：宿主拒绝写入(mutate 抛错)时贴出宿主原文且配置不被改', async () => {
-  const env = limitEnv();
-  env.form.mutate = function () {
-    return Promise.reject(new Error('Config field "maxMembers" is not volatile'));
-  };
-  const { panel, tree } = await limitPanel(env);
-
-  findById(tree, LIMIT_INPUT)[0].props.onChange({ target: { value: '12' } });
-  const after = panel.render();
-  limitApply(after).props.onClick();
-  await settle();
-  const done = panel.render();
-
-  const errors = collectNodes(done).filter(function (node) {
-    return (node.props.className || '').indexOf('fsx-feedback--error') >= 0;
-  });
-  assert.equal(errors.length, 1, '失败必须落到上限控件自己的反馈行');
-  assert.equal(errors[0].props.role, 'alert');
-  const message = textOf(errors[0].children);
-  assert.ok(message.indexOf('maxMembers') >= 0 && message.indexOf('is not volatile') >= 0, '必须贴出宿主原文：' + message);
-  assert.notEqual(env.configValue().maxMembers, 12, '宿主拒绝写入时配置不得被改');
-});
-
-test('成员上限失败态：命名空间不可用时贴出命名空间并零宿主调用', async () => {
-  const env = limitEnv();
-  env.form.getSnapshot = function () {
-    return { status: 'unavailable', value: null, revision: 0, writable: false };
-  };
-  const { panel, tree } = await limitPanel(env);
-
-  findById(tree, LIMIT_INPUT)[0].props.onChange({ target: { value: '12' } });
-  const after = panel.render();
-  limitApply(after).props.onClick();
-  await settle();
-  const done = panel.render();
-
-  const errors = collectNodes(done).filter(function (node) {
-    return (node.props.className || '').indexOf('fsx-feedback--error') >= 0;
-  });
-  assert.equal(errors.length, 1, '失败必须落到上限控件自己的反馈行');
-  const message = textOf(errors[0].children);
-  assert.ok(message.indexOf('dsh-force-subagent') >= 0, '必须贴出是哪个命名空间不可用：' + message);
-  assert.equal(env.mutations.length, 0, '命名空间不可用时不得发起写入');
-});
-
-test('parseMemberLimit：只接受 1..1000 的正整数，拒绝时说明收到了什么', () => {
+test('parseMemberLimit 与 parseDepthLimit：只接受各自区间内的整数，拒绝时说明收到了什么', () => {
   const { __test } = limitEnv().plugin;
 
-  [['1', 1], ['1000', 1000], [' 64 ', 64], ['064', 64], [64, 64], [1, 1], [1000, 1000]]
+  [['1', 1], ['100000', 100000], [' 64 ', 64], ['064', 64], [64, 64], [1, 1], ['1024', 1024]]
     .forEach(function (pair) {
       const parsed = __test.parseMemberLimit(pair[0]);
       assert.equal(parsed.ok, true, JSON.stringify(pair[0]) + ' 应当合法');
@@ -876,12 +952,12 @@ test('parseMemberLimit：只接受 1..1000 的正整数，拒绝时说明收到�
       assert.equal(parsed.error, undefined);
     });
 
-  ['', '   ', '0', '00', '-1', '1001', '1001.0', '1.5', '1e3', '0x10', '１０', 'abc', '64px', 'NaN', 'Infinity']
+  ['', '   ', '0', '00', '-1', '100001', '100001.0', '1.5', '1e3', '0x10', '１０', 'abc', '64px', 'NaN', 'Infinity']
     .forEach(function (raw) {
       const parsed = __test.parseMemberLimit(raw);
       assert.equal(parsed.ok, false, JSON.stringify(raw) + ' 必须被拒绝');
       assert.equal(parsed.limit, undefined);
-      assert.ok(parsed.error.indexOf('成员上限') >= 0);
+      assert.ok(parsed.error.indexOf('成员容量') >= 0);
       assert.ok(parsed.error.indexOf('收到') >= 0, '拒绝必须说明收到了什么：' + parsed.error);
     });
 
@@ -891,6 +967,22 @@ test('parseMemberLimit：只接受 1..1000 的正整数，拒绝时说明收到�
     assert.ok(parsed.error.indexOf('正整数') >= 0);
   });
 
-  assert.equal(__test.parseMemberLimit('1001').error.indexOf('1000') >= 0, true,
-    '拒绝理由必须暴露护栏上限');
+  assert.ok(__test.parseMemberLimit('100001').error.indexOf('100000') >= 0, '拒绝理由必须暴露护栏上限');
+
+  [['0', 0], ['1', 1], ['2', 2], [' 3 ', 3], [1024, 1024]].forEach(function (pair) {
+    const parsed = __test.parseDepthLimit(pair[0]);
+    assert.equal(parsed.ok, true, JSON.stringify(pair[0]) + ' 的深度取值应当合法');
+    assert.equal(parsed.depth, pair[1]);
+  });
+  ['', '  ', '-1', '1.5', 'abc'].forEach(function (raw) {
+    const parsed = __test.parseDepthLimit(raw);
+    assert.equal(parsed.ok, false, JSON.stringify(raw) + ' 的深度取值必须被拒绝');
+    assert.ok(parsed.error.indexOf('嵌套深度') >= 0, parsed.error);
+    assert.ok(parsed.error.indexOf('收到') >= 0, parsed.error);
+  });
+
+  assert.deepEqual(plain(__test.parseCapacitySnapshot({ status: 'loading', value: null })), { limit: null, depth: null });
+  assert.deepEqual(plain(__test.parseCapacitySnapshot({ status: 'ready', value: { maxActiveSubagents: 16 } })), { limit: 16, depth: null });
+  assert.ok(__test.capacityStatusText({ status: 'ready', value: { maxActiveSubagents: 16, maxDepth: 2 } }).text.indexOf('嵌套深度上限 2') >= 0);
+  assert.equal(__test.capacityStatusText({ status: 'unavailable', value: null }), null, '未就绪快照不得伪造当前值');
 });

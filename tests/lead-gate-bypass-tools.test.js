@@ -148,7 +148,7 @@ async function assertReminded(host, tool, agent, label) {
   const reminder = String(notices[0]?.content?.[0]?.text ?? '')
   assert.match(reminder, /^\[team-gate\] 提醒：/, `${label} / ${tool}：提醒前缀必须是「[team-gate] 提醒：」，实际「${reminder}」`)
   assert.ok(reminder.includes(`「${tool}」`), `${label} / ${tool}：提醒必须点名被放行的工具，实际「${reminder}」`)
-  assert.ok(reminder.includes('team_task_create') && reminder.includes('spawn_teammate'), `${label} / ${tool}：提醒必须给出出路 team_task_create → spawn_teammate，实际「${reminder}」`)
+  assert.ok(reminder.includes('team_task_create') && reminder.includes('subagent'), `${label} / ${tool}：提醒必须给出出路 team_task_create → subagent，实际「${reminder}」`)
   return reminder
 }
 
@@ -209,7 +209,7 @@ test('B3 上一轮的 team_task_create 不算本轮证据：本轮首次旁路�
   assert.equal(agent.notices.length, 1, `B3：同一轮不得重复提醒，实际 ${agent.notices.length} 条`)
 })
 
-test('B4 本轮已 spawn_teammate：旁路工具放行且不提醒（门禁判「本轮是否已派出活」）', async (t) => {
+test('B4 本轮已 subagent：旁路工具放行且不提醒（门禁判「本轮是否已派出活」）', async (t) => {
   for (const tool of NEW_BYPASS_TOOLS) {
     await t.test(tool, async () => {
       const host = leadHost()
@@ -319,7 +319,7 @@ test('B11 执行旁路与实现类共用同一判据：同一轮内先 run_code 
   }
 })
 
-test('B12 本轮已 spawn_teammate / 子代理 delegationDepth=1：执行旁路放行且不提醒', async (t) => {
+test('B12 本轮已 subagent / 子代理 delegationDepth=1：执行旁路放行且不提醒', async (t) => {
   for (const tool of EXECUTION_TOOLS) {
     await t.test(`${tool} 本轮已派发`, async () => {
       const host = leadHost()

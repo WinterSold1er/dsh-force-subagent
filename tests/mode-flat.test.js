@@ -136,7 +136,7 @@ test('A) 无 mode 配置：默认 nested，提示词保持 nested 关键句、�
   assert.doesNotMatch(member, /flat/, 'nested 成员提示词不得出现 flat 措辞')
   const lead = sectionText(host, leadAgent('on'))
   assert.match(lead, /team_task_create/)
-  assert.doesNotMatch(lead, /软踢出|没有删除 Team 成员的 API/, 'nested Lead 提示词不得混入 flat 软踢出段')
+  assert.doesNotMatch(lead, /软踢出|没有删除成员的 API/, 'nested Lead 提示词不得混入 flat 软踢出段')
 })
 
 test('B) mode=flat：成员提示词整段换成 flat 版，nested 关键句与 team_task_create 字面量都不出现', () => {
@@ -165,7 +165,7 @@ test('B2) mode=flat：Lead 提示词追加软踢出段（判定完成 → interr
   assert.match(text, /interrupt_agent/, '完成必须 interrupt_agent 中断该成员')
   assert.match(text, /team_task_update/, '完成必须 team_task_update 关闭任务')
   assert.match(text, /不再向该成员 send_message|不再 send_message/, '完成后不得再 send_message / 复用')
-  assert.match(text, /没有删除 Team 成员的 API/, '必须写明宿主没有删除成员 API')
+  assert.match(text, /没有删除成员的 API/, '必须写明宿主没有删除成员 API')
   assert.match(text, /软踢出/, '必须写明这是软踢出而不是删除')
 })
 

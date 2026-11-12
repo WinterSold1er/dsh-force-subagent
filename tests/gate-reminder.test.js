@@ -6,7 +6,7 @@
  *    + 实现工具 write / edit / apply_patch / str_replace_editor
  *    + 执行工具 run_code / terminal_open / terminal_read / terminal_send / terminal_signal，
  *    task-4 / task-8 / task-11）：
- *    判据命中同样只提醒、不拦截——提醒点名工具与出路 team_task_create / spawn_teammate，next 恰好一次；
+ *    判据命中同样只提醒、不拦截——提醒点名工具与出路 team_task_create / subagent，next 恰好一次；
  *    同一轮只提醒一次，新的 turn/start 之后重新提醒一次（去重令牌 = 最后一个 turn/start 的下标）。
  *    Lead 提示词必须预先告知这套「提醒 + 放行」口径。
  *  - 提醒：调用方 Agent 的 inject 恰好收到 1 条 notice（source.form === 'notice'），正文以 [team-gate] 开头、
@@ -146,7 +146,7 @@ test('门禁 1 Lead 取证门禁：本轮无派发就 read → 放行 + 一条�
   const reminder = noticeText(agent.notices[0])
   assert.match(reminder, /read/, `提醒必须点名被放行的工具，实际「${reminder}」`)
   assert.match(reminder, /team_task_create/, `提醒必须点名出路 team_task_create，实际「${reminder}」`)
-  assert.match(reminder, /spawn_teammate/, `提醒必须点名出路 spawn_teammate，实际「${reminder}」`)
+  assert.match(reminder, /subagent/, `提醒必须点名出路 subagent，实际「${reminder}」`)
   // 同一轮再取证一次：判据仍命中、同样放行，但轮次令牌已记录 → 不再重复提醒。
   const again = await runGate(host, 'read', agent)
   assert.equal(again.nextCalls, 1, '第二次取证同样放行')
@@ -220,7 +220,7 @@ test('门禁 5 已完成成员：放行 + 每个已完成成员只提醒一次',
   const lead = agentOf({ id: 'lead-finished', events: leadEvents, membership: membershipOf({ role: 'lead', id: 'lead-1', name: 'lead', rootEvents: leadEvents }) })
   await assertRemindedOnce(
     { tool: 'send_message', host, agent: lead, args: { target: 'worker-1', message: '再改一轮' } },
-    { label: 'Lead 发给已完成成员 worker-1', hint: /spawn_teammate/ },
+    { label: 'Lead 发给已完成成员 worker-1', hint: /subagent/ },
   )
   assert.ok(lead.notices[0].content[0].text.startsWith(FINISHED_PREFIX), `提醒必须保留稳定前缀 ${FINISHED_PREFIX}`)
   const repeated = await runGate(host, 'send_message', lead, { target: 'worker-1', message: '再改一轮' })
@@ -263,14 +263,14 @@ test('提醒投递失败不改变工具结果：无 inject 方法 / inject 抛�
   }
 })
 
-const PARALLEL_RULES = ['拆成互不依赖的小任务', '单轮内并行 spawn', 'write_scopes 互斥', '不要串行建一个等一个']
+const PARALLEL_RULES = ['拆成互不依赖的小任务', '单轮内并行 subagent', 'write_scopes 互斥', '不要串行建一个等一个']
 
 const sectionText = (host, agent) => {
   assert.equal(host.sections.length, 1, '必须恰好注册一个 systemPrompt section')
   return host.sections[0].text({ agent })
 }
 
-test('flat 模式提示词：Lead 段与成员段都要求「拆小任务 + 单轮并行 spawn + write_scopes 互斥 + 不串行」', () => {
+test('flat 模式提示词：Lead 段与成员段都要求「拆小任务 + 单轮并行 subagent + write_scopes 互斥 + 不串行」', () => {
   const leadEvents = [runEvent('on')]
   const host = createHost({ agentTeams: { tryMembership: (agent) => agent?.membership ?? undefined } })
   apply(host.ctx, { mode: 'flat' })
@@ -304,7 +304,7 @@ test('门禁口径：Lead 段必须预先告知「取证 + 实现 + 执行」会
   assert.match(leadText, /工具照常执行/, `Lead 段必须说明工具照常执行（不是拒绝），实际：${leadText}`)
   assert.match(leadText, /每轮/, `Lead 段必须说明提醒按轮次生效，实际：${leadText}`)
   assert.match(leadText, /新一轮[\s\S]*再提醒一次/, `Lead 段必须说明新的用户消息开新一轮后会再提醒一次，实际：${leadText}`)
-  assert.match(leadText, /team_task_create[\s\S]*spawn_teammate/, `Lead 段必须给出出路 team_task_create → 单轮内并行 spawn_teammate，实际：${leadText}`)
+  assert.match(leadText, /team_task_create[\s\S]*subagent/, `Lead 段必须给出出路 team_task_create → 单轮内并行 subagent，实际：${leadText}`)
   // 反例（断言不是恒真）：Lead 段与成员段都不得宣称硬拒绝。
   assert.doesNotMatch(leadText, /LEAD_EVIDENCE_DENIED|已被门禁拒绝|会被拒绝|会被硬拒|已被门禁拦/, `Lead 段不得宣称硬拒绝，实际：${leadText}`)
   assert.doesNotMatch(memberText, /已被门禁拒绝|会被拒绝|已被门禁拦/, `成员段不得宣称硬拒绝，实际：${memberText}`)

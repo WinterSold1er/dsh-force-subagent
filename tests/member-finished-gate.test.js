@@ -13,7 +13,7 @@
  *   reopen 会让已完成成员重新变成「未完成」，task-5 用例 7 与 task-4 第 3 条（reopen 后仍由 claim 拦）就不成立。
  *   零任务成员（刚 spawn）NOT finished。
  * - 软门禁形态（task-22）：不返回 deny，处理器调用 next() 放行，同时向调用方会话 inject 一条 notice；
- *   notice 正文前缀 `[team-gate] TEAM_MEMBER_FINISHED:`，文案给出解法（spawn_teammate 新建成员）。同一会话同一成员只投递一次。
+ *   notice 正文前缀 `[team-gate] TEAM_MEMBER_FINISHED:`，文案给出解法（subagent 新建成员）。同一会话同一成员只投递一次。
  * - 拦（改为提醒）send_message(target) 与 team_task_update(action=claim 调用者自身 / action=reassign owner)；
  *   reopen 不提醒；非成员 target 不提醒；读不到 team 状态 → fail-open 放行 + warn 且不提醒。
  * - interrupt_agent 不在拦的范围：Lead 收敛已完成成员靠它（见 flat 提示词与 mode-flat.test.js B2）。
@@ -205,7 +205,7 @@ const assertFinishedReminded = ({ threw, decisions, nextCalls, handlerCount, not
   const text = reminders[0].content[0].text
   assert.match(
     text,
-    /spawn_teammate|新建成员|新成员/,
+    /subagent|新建成员|新成员/,
     `${label} / ${tool}：提醒必须给出解法（spawn 新成员承接），实际为「${text}」`,
   )
   assert.equal(

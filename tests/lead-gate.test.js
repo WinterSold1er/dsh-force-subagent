@@ -15,17 +15,17 @@
  *   提醒条件 = Lead 会话（ctx.get('agentTeams').tryMembership(exec.agent) 未命中）
  *     + force-subagent 启用（Lead 会话最后一次 command/run（using-agent-team）args 非 off）
  *     + 被调工具 ∈ 三类并集
- *     + 本 turn（事件序列中最后一个 turn/start 之后）没有委派类 tool/call（spawn_teammate / subagent 系列 / workflow）
+ *     + 本 turn（事件序列中最后一个 turn/start 之后）没有委派类 tool/call（subagent / subagent 系列 / workflow）
  *     → 经 agent.inject 投递一条 [team-gate] 提醒，随后 return next() 放行；插件不返回任何拒绝结果。
  *   去重粒度 = 轮次：提醒 key = lead-evidence:${最后一个 turn/start 的下标}，同轮只提醒一次，
  *     新的 turn/start 到来（Lead 收到新消息）后重新提醒一次；
  *   会话是否还有 running 成员、本轮是否 interrupt_agent 过成员都不参与判定（hasRunningMember 与 interrupt_agent 判据已移除）；
- *   编排类工具（team_task_* / spawn_teammate / send_message / wait_agent / list_agents / interrupt_agent）不受影响；
+ *   编排类工具（team_task_* / subagent / send_message / wait_agent / list_agents / interrupt_agent）不受影响；
  *   单靠 team_task_create 不算已派发（仍提醒一次）；
  *   其余全部放行（返回值必须是 next() 的结果）；成员会话（tryMembership 命中）继续走既有成员门禁分支；
  *   fail-open：读取会话事件（snapshotEvents）抛错 → 放行、不提醒、不抛异常。
  * 断言口径：每条用例都核对 next 是否被调用与调用次数；提醒用例核对恰好一条提醒
- *   （点名工具名与 team_task_create / spawn_teammate 出路）+ next 恰好一次 + 无 deny；放行用例核对
+ *   （点名工具名与 team_task_create / subagent 出路）+ next 恰好一次 + 无 deny；放行用例核对
  *   next 恰好一次、返回值来自 next() 且不投递提醒。
  * 构造方式与 tests/member-gate-deny.test.js、tests/member-gate-allow.test.js、tests/gate-observability.test.js 一致：
  *   真实 apply(ctx) 登记的 tools/pre-execute 处理器，不 mock 处理器自身。
@@ -252,18 +252,18 @@ test(`契约：apply 注册 ${GATE_EVENT} 处理器（Lead 门禁断言的前提
   }
 })
 
-test('L1 启用 + Lead + 本轮无派发：bash 放行并提醒一次（提醒点名 bash 与 team_task_create / spawn_teammate）', async (t) => {
+test('L1 启用 + Lead + 本轮无派发：bash 放行并提醒一次（提醒点名 bash 与 team_task_create / subagent）', async (t) => {
   const host = leadHost()
   apply(host.ctx)
   const agent = leadAgent([runEvent('on'), turnStart(1)])
-  await assertReminded(t, host, 'bash', agent, 'L1 Lead 已启用且本轮无派发', /team_task_create[\s\S]*spawn_teammate/)
+  await assertReminded(t, host, 'bash', agent, 'L1 Lead 已启用且本轮无派发', /team_task_create[\s\S]*subagent/)
 })
 
 test('L2 启用 + Lead + 本轮只有 team_task_create（没有派发）：bash 放行并提醒一次（单靠看板不算已派活）', async (t) => {
   const host = leadHost()
   apply(host.ctx)
   const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('team_task_create'), toolCall('team_task_get')])
-  await assertReminded(t, host, 'bash', agent, 'L2 Lead 只建了看板就下场取证', /team_task_create[\s\S]*spawn_teammate/)
+  await assertReminded(t, host, 'bash', agent, 'L2 Lead 只建了看板就下场取证', /team_task_create[\s\S]*subagent/)
 })
 
 test('L3 EVIDENCE_TOOLS 全表同规则：Lead 本轮无派发时逐个放行 + 提醒一次', async (t) => {
@@ -272,7 +272,7 @@ test('L3 EVIDENCE_TOOLS 全表同规则：Lead 本轮无派发时逐个放行 + 
       const host = leadHost()
       apply(host.ctx)
       const agent = leadAgent([runEvent('on'), turnStart(1)])
-      await assertReminded(t, host, tool, agent, `L3 Lead 已启用且本轮无派发（${tool}）`, /team_task_create[\s\S]*spawn_teammate/)
+      await assertReminded(t, host, tool, agent, `L3 Lead 已启用且本轮无派发（${tool}）`, /team_task_create[\s\S]*subagent/)
     })
   }
 })
@@ -347,7 +347,7 @@ test('L7 turn 边界：上一 turn 的 team_task_create 不算本轮证据，本
     await t.test(label, async () => {
       const host = leadHost()
       apply(host.ctx)
-      await assertReminded(t, host, 'bash', leadAgent(events), `L7 ${label}`, /team_task_create[\s\S]*spawn_teammate/)
+      await assertReminded(t, host, 'bash', leadAgent(events), `L7 ${label}`, /team_task_create[\s\S]*subagent/)
     })
   }
 })
@@ -397,7 +397,7 @@ test('L10 subagent 会话头 delegationDepth=1：取证 read 不被 Lead 门禁�
 test('L10b 反向对照：同一 fixture header.delegationDepth=0（Lead）→ read 放行并提醒一次', async (t) => {
   const host = leadHost()
   apply(host.ctx)
-  await assertReminded(t, host, 'read', subAgentWithHeader(0), 'L10b Lead 会话头 delegationDepth=0', /team_task_create[\s\S]*spawn_teammate/)
+  await assertReminded(t, host, 'read', subAgentWithHeader(0), 'L10b Lead 会话头 delegationDepth=0', /team_task_create[\s\S]*subagent/)
 })
 
 test('L10c 会话头缺失按 delegationDepth=0 处理（根会话）→ read 放行并提醒一次', async (t) => {
@@ -409,7 +409,7 @@ test('L10c 会话头缺失按 delegationDepth=0 处理（根会话）→ read �
     notices: [],
     inject(message) { this.notices.push(message) },
   }
-  await assertReminded(t, host, 'read', agent, 'L10c header 缺失按 depth=0 提醒', /team_task_create[\s\S]*spawn_teammate/)
+  await assertReminded(t, host, 'read', agent, 'L10c header 缺失按 depth=0 提醒', /team_task_create[\s\S]*subagent/)
 })
 
 test('L10d 会话头 getter 抛错：fail-open 放行且 warn 恰好 1 次', async (t) => {
@@ -437,12 +437,12 @@ test('L11 本轮没有派发：取证工具逐个放行 + 提醒一次（含 web
       const host = leadHost()
       apply(host.ctx)
       const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('team_task_create'), toolCall('team_task_list')])
-      await assertReminded(t, host, tool, agent, `L11 无派发（${tool}）`, /team_task_create[\s\S]*spawn_teammate/)
+      await assertReminded(t, host, tool, agent, `L11 无派发（${tool}）`, /team_task_create[\s\S]*subagent/)
     })
   }
 })
 
-test('L12 本轮已 spawn_teammate：Lead 取证放行且不提醒（判据只看本轮是否已派发）', async (t) => {
+test('L12 本轮已 subagent：Lead 取证放行且不提醒（判据只看本轮是否已派发）', async (t) => {
   const host = leadHost()
   apply(host.ctx)
   const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('team_task_create'), toolCall('spawn_teammate'), memberEvent('m1')])
@@ -462,7 +462,7 @@ test('L13 interrupt_agent 不参与判定：本轮已派发后中断成员再取
     toolCall('interrupt_agent'),
   ])
   await assertAllowed(t, host, 'grep', agent, 'L13 中断成员后立刻取证（本轮已派发）')
-  // 反例（断言不是恒真）：同一夹具把本轮的 spawn_teammate 去掉 → 判据成立 → 放行 + 提醒一次，而不是拒绝。
+  // 反例（断言不是恒真）：同一夹具把本轮的 subagent 去掉 → 判据成立 → 放行 + 提醒一次，而不是拒绝。
   const bareAgent = leadAgent([
     runEvent('on'),
     turnStart(1),
@@ -511,7 +511,7 @@ test('L15 running 成员判据已移除：成员 active / failed / 任务全部 
     await t.test(`${label}（本轮未派发）`, async () => {
       const host = leadHost()
       apply(host.ctx)
-      await assertReminded(t, host, 'read', leadAgent(events), `L15 ${label} 未派发`, /team_task_create[\s\S]*spawn_teammate/)
+      await assertReminded(t, host, 'read', leadAgent(events), `L15 ${label} 未派发`, /team_task_create[\s\S]*subagent/)
     })
     await t.test(`${label}（本轮已派发）`, async () => {
       const host = leadHost()
@@ -539,7 +539,7 @@ test('L17 本轮没有派发：实现工具逐个放行 + 提醒一次（write /
       const host = leadHost()
       apply(host.ctx)
       const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('team_task_create')])
-      await assertReminded(t, host, tool, agent, `L17 Lead 只建了看板就下场写文件（${tool}）`, /team_task_create[\s\S]*spawn_teammate/)
+      await assertReminded(t, host, tool, agent, `L17 Lead 只建了看板就下场写文件（${tool}）`, /team_task_create[\s\S]*subagent/)
     })
   }
 })
@@ -559,12 +559,12 @@ test('L18 实现工具的提醒正文：前缀 [team-gate] 提醒、点名「实
   assert.match(text, /实现工具「write」/, `L18 / write：必须把它归为实现工具并点名工具名，实际「${text}」`)
   assert.match(text, /仍会照常执行/, `L18 / write：必须说明工具照常执行，实际「${text}」`)
   assert.match(text, /实现与取证都必须委派/, `L18 / write：必须说明实现与取证都必须委派，实际「${text}」`)
-  assert.match(text, /team_task_create[\s\S]*spawn_teammate/, `L18 / write：必须给出正确做法，实际「${text}」`)
+  assert.match(text, /team_task_create[\s\S]*subagent/, `L18 / write：必须给出正确做法，实际「${text}」`)
   assert.match(text, /新的 turn 开始后会再提醒一次/, `L18 / write：必须说明按轮刷新，实际「${text}」`)
   assert.deepEqual(host.warnings, [], `L18 / write：提醒投递不属于 fail-open，不得 warn，实际：${JSON.stringify(host.warnings)}`)
 })
 
-test('L19 本轮已 spawn_teammate：Lead 的 write 放行且不提醒（门禁判「本轮是否已派出活」，不是一律封写）', async (t) => {
+test('L19 本轮已 subagent：Lead 的 write 放行且不提醒（门禁判「本轮是否已派出活」，不是一律封写）', async (t) => {
   const host = leadHost()
   apply(host.ctx)
   const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('team_task_create'), toolCall('spawn_teammate'), memberEvent('m1')])
@@ -598,7 +598,7 @@ test('L22 本轮没有派发：执行类工具逐个放行 + 提醒一次（run_
       const host = leadHost()
       apply(host.ctx)
       const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('team_task_create')])
-      await assertReminded(t, host, tool, agent, `L22 Lead 只建了看板就下场执行（${tool}）`, /team_task_create[\s\S]*spawn_teammate/)
+      await assertReminded(t, host, tool, agent, `L22 Lead 只建了看板就下场执行（${tool}）`, /team_task_create[\s\S]*subagent/)
     })
   }
 })
@@ -617,13 +617,13 @@ test('L23 执行类工具的提醒正文：前缀 [team-gate] 提醒、逐个点
       const text = agent.notices[0]?.content?.[0]?.text
       assert.match(text, new RegExp(`^\\[team-gate\\] 提醒：本轮还没有派发成员，执行工具「${tool}」`), `L23 / ${tool}：必须归类为「执行工具」并点名工具名，实际「${text}」`)
       assert.match(text, /执行工具本身就是取证与实现的等价通道/, `L23 / ${tool}：必须说明它是取证与实现的等价通道，实际「${text}」`)
-      assert.match(text, /team_task_create[\s\S]*spawn_teammate/, `L23 / ${tool}：必须给出正确做法，实际「${text}」`)
+      assert.match(text, /team_task_create[\s\S]*subagent/, `L23 / ${tool}：必须给出正确做法，实际「${text}」`)
       assert.deepEqual(host.warnings, [], `L23 / ${tool}：提醒投递不属于 fail-open，不得 warn，实际：${JSON.stringify(host.warnings)}`)
     })
   }
 })
 
-test('L24 本轮已 spawn_teammate：Lead 的执行类工具放行且不提醒（门禁判「本轮是否已派出活」，不是一律提醒执行）', async (t) => {
+test('L24 本轮已 subagent：Lead 的执行类工具放行且不提醒（门禁判「本轮是否已派出活」，不是一律提醒执行）', async (t) => {
   for (const tool of EXECUTION_TOOLS) {
     await t.test(tool, async () => {
       const host = leadHost()

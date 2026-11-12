@@ -205,6 +205,8 @@ test('module.exports.__test 暴露纯逻辑给 Node 调用', () => {
     'workspaceKeyOf',
     'workspaceTitleOf',
     'workspacesRecordOf',
+    'buildAllWorkspacesMutation',
+    'enumerableWorkspaceKeys',
   ]) {
     assert.equal(typeof plugin.__test[name], 'function', 'missing __test.' + name);
   }
@@ -457,12 +459,14 @@ test('窄屏 320/375px：header 换行、chip 可收缩、长串不撑破容器�
   assert.match(CODE, /#dsh-force-subagent\{[^}]*overflow-wrap:break-word/, '根容器必须仍能换行超长串；不得用 anywhere——anywhere 会把 flex 项的 min-content 塌到单字');
   assert.match(CODE, /#dsh-force-subagent\{[^}]*width:100%;max-width:640px/, '面板必须是流式宽度（窄屏上限 640px，不再是 560px 窄条）');
   assert.doesNotMatch(CODE, /\.fsx-[a-z-]+\{[^}]*display:none/, '不得用 display:none 掩盖溢出');
-  assert.match(CODE, /\.fsx-input\{[^}]*width:100%[^}]*max-width:140px/, '成员上限输入必须可收缩，不得定宽撑破窄屏');
-  assert.match(CODE, /\.fsx-input\{[^}]*min-height:44px/, '成员上限输入必须是 44px 触控目标');
-  assert.match(CODE, /\.fsx-field\{[^}]*min-width:0/, '上限所在卡片字段必须可收缩');
-  assert.match(CODE, /\.fsx-savebar\{[^}]*flex-wrap:wrap/, '上限一行必须复用可换行的按钮排');
-  assert.match(CODE, /className: 'fsx-card fsx-field'(?:(?!className: 'fsx-card)[\s\S]){0,900}id: 'fsx-member-limit'/,
-    '成员上限必须挂在可换行的卡片字段里，而不是浮在卡外（输入与卡片开标签之间不得跨入另一张卡）');
+  assert.match(CODE, /\.fsx-input\{[^}]*width:100%[^}]*max-width:140px/, '成员容量输入必须可收缩，不得定宽撑破窄屏');
+  assert.match(CODE, /\.fsx-input\{[^}]*min-height:44px/, '成员容量输入必须是 44px 触控目标');
+  assert.match(CODE, /\.fsx-field\{[^}]*min-width:0/, '容量所在卡片字段必须可收缩');
+  assert.match(CODE, /\.fsx-savebar\{[^}]*flex-wrap:wrap/, '容量一行必须复用可换行的按钮排');
+  assert.match(CODE, /className: 'fsx-card fsx-field'(?:(?!className: 'fsx-card)[\s\S]){0,1200}id: 'fsx-member-limit'/,
+    '成员容量必须挂在可换行的卡片字段里，而不是浮在卡外（输入与卡片开标签之间不得跨入另一张卡）');
+  assert.match(CODE, /id: 'fsx-member-limit'(?:(?!className: 'fsx-card)[\s\S]){0,1200}id: 'fsx-member-depth'/,
+    '深度输入必须与容量输入同处一张卡片，窄屏才不会各占一整行');
   const fixedWidths = [...CODE.matchAll(/(?<![-\w])width:(\d+)px/g)].map((m) => Number(m[1]));
   assert.ok(fixedWidths.length > 0, '遍历必须真的抓到固定宽度声明，否则下一条断言是空判');
   assert.ok(fixedWidths.every((w) => w < 300), '固定宽度不得逼近 320px 视口：' + fixedWidths.join(','));
@@ -581,4 +585,84 @@ test('字阶分三级：11 辅助 / 13 正文 / 20 标题，卡标题 14 与 lab
   assert.equal(got.eyebrow, 11, '眉标 11');
   const distinct = new Set(Object.values(got));
   assert.ok(distinct.size >= 4, '同一页面上至少要有 4 个可区分的字号，不能只靠字重：' + [...distinct].join('/'));
+});
+
+test('buildAllWorkspacesMutation：入参一字不改，返回既有键∪枚举键，只替换 member/subagent 并保留条目上的其它字段', () => {
+  const { __test } = loadPlugin();
+  const current = {
+    '/a': { member: { provider: 'old', model: 'old' }, subagent: { provider: 'old', model: 'old' }, extra: 'keep-a' },
+    '/b': { member: { provider: 'x', model: 'y' }, note: 'keep-b' },
+    '/only-config': { member: { provider: 'z', model: 'w' }, note: 'legacy' },
+  };
+  const snapshot = JSON.parse(JSON.stringify(current));
+  const items = [
+    { path: '/a', workspaceId: 'w1' },
+    { path: '/c' },
+    { path: '', workspaceId: 'w3' },
+  ];
+  const draft = { memberProvider: 'alpha', memberModel: 'alpha-fast', subagentProvider: 'beta', subagentModel: 'beta-slow' };
+
+  const next = __test.buildAllWorkspacesMutation(current, items, draft);
+
+  assert.notEqual(next, current, '必须返回新表，不能就地改宿主快照');
+  assert.notEqual(next['/a'], current['/a'], '被广播的条目必须是新对象，否则面板仍在读的快照会被改写');
+  assert.deepEqual(current, snapshot, '入参必须一字未改');
+
+  assert.deepEqual(Object.keys(next).sort(), ['/a', '/b', '/c', '/only-config', 'w3'],
+    '必须写「既有键 ∪ 枚举键」：既不被当前选中的工作区限死，也不丢配置里已有的其它键');
+
+  const ROUTE_MEMBER = { provider: 'alpha', model: 'alpha-fast' };
+  const ROUTE_SUBAGENT = { provider: 'beta', model: 'beta-slow' };
+  assert.deepEqual(next['/a'], { member: ROUTE_MEMBER, subagent: ROUTE_SUBAGENT, extra: 'keep-a' },
+    '已存在的条目只能换掉两条路由，未知字段必须原样留着');
+  assert.deepEqual(next['/c'], { member: ROUTE_MEMBER, subagent: ROUTE_SUBAGENT }, '没配置过的枚举工作区必须被新建出来');
+  assert.deepEqual(next['w3'], { member: ROUTE_MEMBER, subagent: ROUTE_SUBAGENT },
+    'path 为空的条目按 workspaceId 兜底成键（与 workspaceKeyOf 同语义）');
+  assert.deepEqual(next['/b'], current['/b'], '没被枚举到的既有条目不得被动过');
+  assert.deepEqual(next['/only-config'], current['/only-config'], '只存在于配置里的工作区不得被广播抹掉');
+});
+
+test('buildAllWorkspacesMutation：缺失字段补全成完整路由、空 draft 清成继承默认、items 空或非数组时不新增任何工作区', () => {
+  const { __test } = loadPlugin();
+
+  const partial = __test.buildAllWorkspacesMutation(
+    { '/a': { member: { provider: 'keep', model: 'keep' } } },
+    [{ path: '/a' }],
+    { memberProvider: 'alpha', memberModel: 'alpha-fast' },
+  );
+  assert.deepEqual(partial['/a'], {
+    member: { provider: 'alpha', model: 'alpha-fast' },
+    subagent: { provider: '', model: '' },
+  }, '条目缺 subagent、draft 缺 subagent 字段时必须补成完整路由，不能留 undefined');
+
+  const cleared = __test.buildAllWorkspacesMutation(
+    { '/a': { member: { provider: 'old', model: 'old' }, subagent: { provider: 'old', model: 'old' } } },
+    [{ path: '/a' }],
+    {},
+  );
+  assert.deepEqual(cleared['/a'], { member: { provider: '', model: '' }, subagent: { provider: '', model: '' } },
+    '空 draft 必须显式写成继承默认，而不是残留旧值');
+
+  const current = { '/a': { member: { provider: 'x', model: 'y' } } };
+  for (const items of [[], undefined, null, 'nope', [null, {}, { workspaceId: '' }]]) {
+    const next = __test.buildAllWorkspacesMutation(current, items, { memberProvider: 'a', memberModel: 'b' });
+    assert.deepEqual(Object.keys(next).sort(), ['/a'], '枚举不到任何键时不得新增工作区，也不得抛错');
+    assert.equal(next['/a'], current['/a'], '没被枚举到的条目必须原样保留（同一个引用即可，别做无用深拷贝）');
+  }
+});
+
+test('enumerableWorkspaceKeys：按枚举顺序去重、path 优先 workspaceId 兜底、解析不出键的条目跳过', () => {
+  const { __test } = loadPlugin();
+  assert.deepEqual(__test.enumerableWorkspaceKeys([
+    { path: '/b' },
+    { path: '/a' },
+    { path: '/b' },
+    { workspaceId: 7 },
+    { path: '', workspaceId: 'w9' },
+    {},
+    null,
+    'not-an-object',
+  ]), ['/b', '/a', '7', 'w9'], '顺序必须跟随枚举、重复键只留一次、坏条目只跳过不产出 undefined 键');
+  assert.deepEqual(__test.enumerableWorkspaceKeys(undefined), [], '非数组必须安全返回空表');
+  assert.deepEqual(__test.enumerableWorkspaceKeys([]), []);
 });
