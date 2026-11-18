@@ -127,7 +127,7 @@ cd /home/csy/.dsh/profiles/web && node --input-type=module -e "console.log(impor
 node --input-type=module -e "import('/home/csy/Code/Github/dsh-force-subagent/index.js').then(m=>console.log(m.inject))"
 ```
 
-期望：`[ 'commands', 'systemPrompt', 'subagents' ]`（若看到 `agentTeams` 或缺少 `subagents`，说明加载的是旧版，需重启 host）
+期望：`[ 'commands', 'systemPrompt', 'subagents', 'tools' ]`（若看到 `agentTeams` 或缺少 `subagents`，说明加载的是旧版，需重启 host）。其中 `tools` 是能力探测的软依赖：缺失时按探测失败降级（standard 档文案 + 每次 apply 一条 warn），不阻塞 apply。
 
 ### 4. 失败排查
 
@@ -138,6 +138,15 @@ node --input-type=module -e "import('/home/csy/Code/Github/dsh-force-subagent/in
 | 报 engines 不兼容（需 dsh >= 0.2.1-rc.1） | 升级 DSH；不要改插件的 `engines`。 |
 | `dsh: [.../cordis.patch.yml] patch: entry "..." not found` | profile 中其它 patch 的既有告警（例如 `llm-commandcode`），与本插件无关；不影响本插件区块出现。 |
 | 运行中的 :3080 行为无变化 | 属预期：未重启，见下一节。 |
+
+### 5. 全量测试（仓库侧验收，不依赖宿主进程）
+
+```bash
+cd /home/csy/Code/Github/dsh-force-subagent
+node --test "tests/**/*.test.js"
+```
+
+期望：`ℹ tests 682`、`ℹ pass 682`、`ℹ fail 0`。全量口径含 `tests/verify/`（`using-agent-team.test.js` 的 18 个契约用例），当前基线 **682 tests 起**（只增不减）。旧写法 `node --test tests/*.test.js` 只覆盖 664 个用例，会把 `tests/verify/` 漏在口径外。
 
 ## 生效：必须手动重启 host
 
@@ -184,6 +193,41 @@ cp -p /home/csy/.dsh/profiles/web/package.json.bak-<TS> /home/csy/.dsh/profiles/
 
 卸载同样需要重启才生效；脚本不会删除备份。
 
+## 内置 skills（安装后自动出现，无需手工拷贝）
+
+插件自带 4 个 team 技能：`team-adversarial-gatekeeper`、`team-lead-delegation`、`team-parallel-dispatch`、`team-recursive-orchestration`。重启 host 后它们直接出现在技能列表，**不需要**手工拷贝到 `~/.dsh/skills`，也不需要往 profile 里加任何东西：`package.json` 的 `files` 已包含 `skills`，插件加载时通过宿主 `skills` 服务的 `registerProvider` 从本包 `skills/<name>/SKILL.md` 按需只读加载（`provider = 'dsh-force-subagent'`、`source = 'custom'`、`rank = 550`）。
+
+自检（不重启、不启动新服务）：
+
+```bash
+cd /home/csy/.dsh/profiles/web && node --input-type=module -e "import('/home/csy/Code/Github/dsh-force-subagent/index.js').then(async m=>console.log((await m.listPackagedSkillCandidates(m.PACKAGED_SKILLS_ROOT)).map(s=>[s.name,s.rank,s.source,s.provider].join(' | ')).join('\n')))"
+```
+
+期望（4 行，顺序按目录枚举）：
+
+```text
+team-adversarial-gatekeeper | 550 | custom | dsh-force-subagent
+team-lead-delegation | 550 | custom | dsh-force-subagent
+team-parallel-dispatch | 550 | custom | dsh-force-subagent
+team-recursive-orchestration | 550 | custom | dsh-force-subagent
+```
+
+- 这条自检只证明「本包能发现这 4 条候选」；它们是否出现在会话的技能列表取决于宿主 `skills` 服务是否加载。宿主没装 skill 层（headless 组合）时这 4 条不出现，插件不抛也不 warn，门禁与委派提示照旧。
+- **确认命中来源（第二步自检）**：上一步不说明宿主最终取哪一份。宿主合并后的每条技能都带 `source` 与 `path`（`packages/skill/skill/src/index.ts` 的 `SkillSummary`），比对其余层同名条目即可判定命中来源：
+
+  ```bash
+  # 1) ~/.dsh/skills 里是否存在同名拷贝、是不是 rc.1 旧版（签名词 spawn_teammate / pull-based）
+  ls -d ~/.dsh/skills/team-* 2>/dev/null
+  grep -l "spawn_teammate" ~/.dsh/skills/team-*/SKILL.md 2>/dev/null
+  # 2) 随包版本的签名词（batched subagent / board-driven）
+  grep -c "batched subagent\|board-driven" /home/csy/Code/Github/dsh-force-subagent/skills/team-parallel-dispatch/SKILL.md
+  ```
+
+  判读：第 1 步有输出 = `~/.dsh/skills` 存在同名旧拷贝，按下一条《重名优先级》的条件式结论（两者同在 global 层时 400 更小），会话里命中的是那一份（`list()` 结果的 `path` 会指向 `~/.dsh/skills/<name>/SKILL.md`、`source` 为 `user-dsh`）；要用随包版本就手工删掉或更新它。若 `list()` 结果的 `path` 指向 `/home/csy/Code/Github/dsh-force-subagent/skills/<name>/SKILL.md`、`provider` 为 `dsh-force-subagent`，才说明取到的是随包版本。按当前状态（旧拷贝已迁移，见下一条）第 1 步应当无输出、命中随包版本。
+- **重名优先级（层口径，不是纯 rank）**：宿主 skill registry 的真实契约是「跨层由最近的一层直接胜出，`rank` 只在同一层内决定重名」（`packages/skill/skill/src/index.ts` 的 `collectFresh` 注释：「the nearest layer's same-name entry replaces the farther ones … Rank decides duplicates only within one layer」）。provider 落在哪一层由它挂在哪决定（挂在 agent preset 的 standing composition 上就落在该 preset 层）。宿主常量 `USER_DSH_RANK = 400`、`USER_AGENTS_RANK = 500`、`BUNDLED_SKILL_RANK = 600` 只用于各自层内的重名比较，不能跨层排序。条件式结论（不是无条件事实）：若本插件 provider 与 `~/.dsh/skills`（宿主 `user-dsh` 根）**同在 global 层**，同层比 rank，则 `~/.dsh/skills` 的同名条目（400）胜过本插件（550），本插件（550）胜过同层的 bundled 根（600）。当前实际状态（2026-11-18 14:05 起）：`~/.dsh/skills/team-*` 四份旧拷贝已迁移到 `~/.dsh/backups/skills-team-20261118-140511/`，`~/.dsh/skills` 已无同名条目，因此当前命中的是随包 provider（550），上面自检的第 1 步现在应当无输出；若日后把旧拷贝放回 `~/.dsh/skills`，同层按 rank 400 胜出。若 `~/.dsh/skills` 里还留着同名旧拷贝（例如仍写 `spawn_teammate` 的 rc.1 版），命中的是那一份；要用随包版本，需手工删除或更新 `~/.dsh/skills/<name>`，插件不会替你删。反过来，若某台宿主上本插件 provider 落在更近的层，同名会由本插件胜出，与 550 / 400 的大小无关。
+- 正文按需只读加载：改 `skills/<name>/SKILL.md` 后，由宿主下一次刷新技能目录或加载该技能时读到新内容；若宿主缓存了候选列表，重启 host 即刷新。不需要重装，也不涉及 `pnpm install`。
+- 卸载插件后这 4 条随插件 scope 一起注销；`~/.dsh/skills` 里若没有你自己放的同名技能，无需手工清理。
+
 ## 风险与限制
 
 - **热加载只覆盖浏览器半边**：安装、卸载、改宿主侧 `index.js` 后必须重启 host；只改 `client.js` 由 client-hmr 自动重建并重跑 `apply`，通常无需重启（见 README §部署）。
@@ -202,5 +246,6 @@ cp -p /home/csy/.dsh/profiles/web/package.json.bak-<TS> /home/csy/.dsh/profiles/
 | `/home/csy/.dsh/profiles/web/node_modules/dsh-force-subagent` | 新建符号链接 | → `/home/csy/Code/Github/dsh-force-subagent` |
 | `/home/csy/.dsh/profiles/web/package.json.bak-<YYYYmmdd-HHMMSS>` | 备份 | 脚本或手动步骤自动生成 |
 | `/home/csy/Code/Github/dsh-force-subagent/cordis.patch.yml` | 不修改 | 由插件 `package.json` 的 `dsh.bundle.patch` 随 bundle 自动应用（`insert: id/name`） |
+| `~/.dsh/skills` | 不需要写入 | 4 个内置 skills 由插件经宿主 `skills.registerProvider` 从本包 `skills/` 注册（`package.json` 的 `files` 已含 `skills`），不经目录拷贝 |
 
 不修改插件源码、不写 profile 的 `cordis.patch.yml`、不运行 `pnpm install`、不重启任何服务。

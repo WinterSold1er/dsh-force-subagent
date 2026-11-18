@@ -10,6 +10,8 @@
  *   4) 去重口径 = 「会话 + 注入路由」：同一组合只留痕一次；kind 不同或注入模型不同则各一次。
  *   5) 会话当前模型读不到（无 sessionProjections 服务 / 视图缺该单元 / provider|model 不成对）
  *      → 不比较、不 warn、不投递；读取抛错 → fail-open：warn 恰好一次、注入照常、不抛异常。
+ *   6) 注入与留痕对 0.2.2-rc.2 的**扁平** SubagentActivationSpec（parent / agentOptions 在顶层、无 request
+ *      包装、可完全没有 childId）同样成立：见 R16-R18。旧用例只在 rc.1 的 request 包装形状上成立。
  * 会话当前模型的读取口径取宿主真实读面（不是猜字段）：
  *   ctx.sessionProjections.snapshot(session).values.modelSelection 是 wire 视图 { lastUsed, next }，
  *   next = pending ?? lastUsed（packages/core/agent/src/model-selection.ts:86-89），
@@ -134,11 +136,12 @@ const parentAgent = (host, session) => ({
   },
 })
 
-const childSpec = (agent, { childId, provider = 'spawn', request = {} } = {}) => ({
+const childSpec = (agent, { childId, provider = 'spawn', request = {}, name, label = 'impl' } = {}) => ({
   delivery: 'parent',
   ...(childId === undefined ? {} : { childId }),
   provider,
-  label: 'impl',
+  ...(name === undefined ? {} : { name }),
+  label,
   request: { prompt: 'do work', parent: agent, ...request },
   signal: new AbortController().signal,
 })
@@ -420,4 +423,207 @@ test('R15 sessionModelSelection 单元：读 wire 视图 next ?? lastUsed，判�
   assert.equal(sessionModelSelection({ get: () => undefined }, undefined), undefined, 'R15：无会话返回 undefined')
   const malformed = { get: () => ({ snapshot: () => ({ values: { modelSelection: { lastUsed: { provider: '', model: 'm' }, next: null } } }) }) }
   assert.equal(sessionModelSelection(malformed, { id: 's1' }), undefined, 'R15：provider 为空串时判定不了，返回 undefined')
+})
+
+/**
+ * 0.2.2-rc.2 的 SubagentActivationSpec 是**扁平**的：`extends Omit<SubagentStartRequest, 'label' | 'signal'>`
+ * （packages/subagent/subagent/src/types.ts:29），parent / agentOptions 直接在 spec 顶层，宿主调用点
+ * （packages/subagent/tool-subagent/src/index.ts:317-333）也不会造出 `request` 包装。
+ * R16-R18 把上面的留痕契约钉在这条真实形状上：旧用例（R1-R14）用的是 rc.1 的 request 包装形状，
+ * 只证明兼容写回，不证明线上扁平路径真的走到注入与留痕。
+ */
+const flatSpec = (agent, { childId, provider = 'spawn', agentOptions } = {}) => ({
+  delivery: 'parent',
+  ...(childId === undefined ? {} : { childId }),
+  provider,
+  label: 'impl',
+  prompt: [{ type: 'text', text: 'do work' }],
+  parent: agent,
+  ...(agentOptions === undefined ? {} : { agentOptions }),
+  signal: new AbortController().signal,
+})
+
+test('R16 rc.2 扁平 spec：覆盖 ≠ 会话当前模型 → 顶层 agentOptions 注入 + 恰好一次留痕 + 恰好一条 MODEL_OVERRIDE notice', async () => {
+  const host = createHost({ projection: () => modelView(SESSION_ROUTE) })
+  apply(host.ctx, workspaceConfig({ member: { ...MEMBER_ROUTE }, subagent: { ...MEMBER_ROUTE } }))
+  const agent = parentAgent(host, leadSession([runEvent('on'), memberEvent('child-1')]))
+
+  for (let index = 0; index < 3; index += 1) {
+    await host.subagents.startActivation(flatSpec(agent, { childId: 'child-1' }))
+  }
+
+  const seen = forwarded(host)
+  assert.equal('request' in seen, false, 'R16：扁平 spec 不得被造出 request 包装——宿主 manager 只读 spec.agentOptions')
+  assert.deepEqual(
+    seen?.agentOptions,
+    { provider: MEMBER_ROUTE.provider, model: MEMBER_ROUTE.model },
+    'R16：覆盖必须写在顶层 agentOptions（留痕不得改变路由结果）',
+  )
+
+  const warns = overrideWarnings(host)
+  assert.equal(warns.length, 1, `R16：扁平形状同样必须恰好留痕一次，实际 ${warns.length} 次：${JSON.stringify(warns)}`)
+  const text = String(warns[0])
+  assert.ok(text.includes(SESSION_ID), `R16：留痕必须含 session id ${SESSION_ID}，实际「${text}」`)
+  assert.ok(text.includes(`${SESSION_ROUTE.provider}/${SESSION_ROUTE.model}`), `R16：留痕必须含会话当前模型，实际「${text}」`)
+  assert.ok(text.includes(`${MEMBER_ROUTE.provider}/${MEMBER_ROUTE.model}`), `R16：留痕必须含注入模型，实际「${text}」`)
+  assert.ok(text.includes(WORKSPACE_KEY), `R16：留痕必须含 workspace key ${WORKSPACE_KEY}，实际「${text}」`)
+  assert.deepEqual(host.warnings, warns, `R16：扁平形状不得产生其它 warn，实际：${JSON.stringify(host.warnings)}`)
+
+  assert.equal(host.notices.length, 1, `R16：扁平形状的覆盖 notice 必须恰好一条，实际 ${host.notices.length} 条`)
+  const noticeText = String(host.notices[0]?.content?.[0]?.text ?? '')
+  assert.match(noticeText, /^\[team-gate\] MODEL_OVERRIDE:/, `R16：notice 必须走 [team-gate] 提醒通道，实际「${noticeText}」`)
+  assert.ok(noticeText.includes(`${MEMBER_ROUTE.provider}/${MEMBER_ROUTE.model}`), `R16：notice 必须点名注入模型，实际「${noticeText}」`)
+  assert.ok(noticeText.includes(`${SESSION_ROUTE.provider}/${SESSION_ROUTE.model}`), `R16：notice 必须点名被覆盖的会话模型，实际「${noticeText}」`)
+  assert.equal(host.notices[0]?.source?.kind, 'force-subagent', 'R16：notice 必须复用既有 force-subagent notice 形态')
+})
+
+test('R17 rc.2 扁平 spec：覆盖 = 会话当前模型 → 注入照常、零留痕、零 notice（R1 在扁平形状上的复刻）', async () => {
+  const host = createHost({ projection: () => modelView(MEMBER_ROUTE) })
+  apply(host.ctx, workspaceConfig({ member: { ...MEMBER_ROUTE }, subagent: { ...MEMBER_ROUTE } }))
+  const agent = parentAgent(host, leadSession([runEvent('on'), memberEvent('child-1')]))
+
+  for (let index = 0; index < 3; index += 1) {
+    await host.subagents.startActivation(flatSpec(agent, { childId: 'child-1' }))
+  }
+
+  assert.deepEqual(
+    forwarded(host)?.agentOptions,
+    { provider: MEMBER_ROUTE.provider, model: MEMBER_ROUTE.model },
+    'R17：同模型也必须注入（留痕静默 ≠ 取消注入）',
+  )
+  assert.equal('request' in forwarded(host), false, 'R17：不得因为留痕分支而造出 request 包装')
+  assert.deepEqual(overrideWarnings(host), [], 'R17：注入模型 = 会话当前模型时不得留痕（R1 语义不得放宽）')
+  assert.deepEqual(readFailureWarnings(host), [], 'R17：同模型路径不得出现读取失败兜底告警')
+  assert.deepEqual(host.notices, [], 'R17：同模型路径不得投递 MODEL_OVERRIDE notice')
+  assert.deepEqual(host.warnings, [], 'R17：整条扁平链路必须零告警')
+})
+
+test('R18 rc.2 纯扁平形状（无 childId、成员身份解析不了）：注入与留痕仍必须发生，并按 subagent 路由各一次', async () => {
+  const host = createHost({ projection: () => modelView(SESSION_ROUTE) })
+  apply(host.ctx, workspaceConfig({ subagent: { ...SUBAGENT_ROUTE } }))
+  const agent = parentAgent(host, leadSession([runEvent('on')]))
+
+  await host.subagents.startActivation(flatSpec(agent))
+
+  const seen = forwarded(host)
+  assert.equal('request' in seen, false, 'R18：宿主收到的必须还是扁平 spec')
+  assert.deepEqual(
+    seen?.agentOptions,
+    { provider: SUBAGENT_ROUTE.provider, model: SUBAGENT_ROUTE.model },
+    'R18：身份解析不了时必须按 subagent 路由注入，不得放宽成成员路由',
+  )
+  assert.equal(overrideWarnings(host).length, 1, `R18：无 childId 的扁平形状同样必须留痕一次，实际：${JSON.stringify(host.warnings)}`)
+  assert.ok(String(overrideWarnings(host)[0]).includes(`${SUBAGENT_ROUTE.provider}/${SUBAGENT_ROUTE.model}`), 'R18：留痕必须点名实际注入的路由')
+  assert.equal(host.notices.length, 1, `R18：必须恰好一条 MODEL_OVERRIDE notice，实际 ${host.notices.length} 条`)
+  assert.match(String(host.notices[0]?.content?.[0]?.text ?? ''), /^\[team-gate\] MODEL_OVERRIDE:/, 'R18：notice 必须走 [team-gate] 通道')
+})
+
+// ── reviewer（审查代码模型）的覆盖留痕 ────────────────────────────────────────
+
+const REVIEWER_ROUTE = { provider: 'prov-review', model: 'model-review' }
+const noticeText = (host, index = 0) => String(host.notices[index]?.content?.[0]?.text ?? '')
+
+test('R19 reviewer 注入 ≠ 会话当前模型：恰好一次 warn（点名「审查代码」与来源）+ 一条 MODEL_OVERRIDE notice，注入仍生效', async () => {
+  const host = createHost({ projection: () => modelView(SESSION_ROUTE) })
+  apply(host.ctx, workspaceConfig({ member: { ...MEMBER_ROUTE }, subagent: { ...SUBAGENT_ROUTE }, reviewer: { ...REVIEWER_ROUTE } }))
+  const agent = parentAgent(host, leadSession([runEvent('on'), memberEvent('child-1')]))
+
+  for (let index = 0; index < 3; index += 1) {
+    await host.subagents.startActivation(childSpec(agent, { childId: 'child-1', name: 'reviewer', label: 'review impl' }))
+  }
+
+  assert.deepEqual(
+    forwarded(host)?.request?.agentOptions,
+    { provider: REVIEWER_ROUTE.provider, model: REVIEWER_ROUTE.model },
+    'R19：reviewer 路由必须真的注入到宿主收到的 spec（留痕不得改变注入结果）',
+  )
+
+  const warns = overrideWarnings(host)
+  assert.equal(warns.length, 1, `R19：同一「会话 + kind + 注入路由」必须恰好 warn 一次，实际 ${warns.length} 次：${JSON.stringify(warns)}`)
+  const text = String(warns[0])
+  assert.ok(text.includes(SESSION_ID), `R19：warn 必须含 session id，实际「${text}」`)
+  assert.ok(text.includes(`${SESSION_ROUTE.provider}/${SESSION_ROUTE.model}`), `R19：warn 必须含会话当前模型，实际「${text}」`)
+  assert.ok(text.includes(`${REVIEWER_ROUTE.provider}/${REVIEWER_ROUTE.model}`), `R19：warn 必须含注入模型，实际「${text}」`)
+  assert.ok(text.includes('审查代码'), `R19：warn 必须点名 kind 是「审查代码」，实际「${text}」`)
+  assert.ok(text.includes(WORKSPACE_KEY) && text.includes('reviewer 条目覆盖'), `R19：warn 必须点名来源是工作区 reviewer 条目，实际「${text}」`)
+  assert.ok(!text.includes('成员'), `R19：kind 不得仍记成成员，实际「${text}」`)
+  assert.deepEqual(host.warnings, warns, `R19：不得产生其它 warn，实际：${JSON.stringify(host.warnings)}`)
+
+  assert.equal(host.notices.length, 1, `R19：notice 必须恰好一条，实际 ${host.notices.length} 条`)
+  assert.match(noticeText(host), /^\[team-gate\] MODEL_OVERRIDE:/, 'R19：notice 必须走 [team-gate] 通道')
+  assert.ok(noticeText(host).includes('审查代码'), `R19：notice 必须点名「审查代码」，实际「${noticeText(host)}」`)
+  assert.ok(noticeText(host).includes(`${REVIEWER_ROUTE.provider}/${REVIEWER_ROUTE.model}`), `R19：notice 必须点名注入模型，实际「${noticeText(host)}」`)
+})
+
+test('R20 reviewer 注入 = 会话当前模型：零 warn 零 notice，注入照常', async () => {
+  const host = createHost({ projection: () => modelView(SESSION_ROUTE) })
+  apply(host.ctx, workspaceConfig({ member: { ...MEMBER_ROUTE }, reviewer: { ...SESSION_ROUTE } }))
+  const agent = parentAgent(host, leadSession([runEvent('on'), memberEvent('child-1')]))
+
+  for (let index = 0; index < 2; index += 1) {
+    await host.subagents.startActivation(childSpec(agent, { childId: 'child-1', name: 'code-reviewer' }))
+  }
+
+  assert.deepEqual(
+    forwarded(host)?.request?.agentOptions,
+    { provider: SESSION_ROUTE.provider, model: SESSION_ROUTE.model },
+    'R20：注入仍然发生，只是没有覆盖可言',
+  )
+  assert.deepEqual(host.warnings, [], `R20：注入等于会话模型时不得留痕，实际：${JSON.stringify(host.warnings)}`)
+  assert.deepEqual(host.notices, [], 'R20：注入等于会话模型时不得投递 notice')
+})
+
+test('R21 去重口径含 kind：同一注入路由分别作为成员与审查代码注入时各留痕一次，重复激活不再重复', async () => {
+  const host = createHost({ projection: () => modelView(SESSION_ROUTE) })
+  // member 与 reviewer 配成同一条路由：注入模型完全相同，只有 kind 不同 → 必须留痕两次。
+  apply(host.ctx, workspaceConfig({ member: { ...REVIEWER_ROUTE }, subagent: { ...REVIEWER_ROUTE }, reviewer: { ...REVIEWER_ROUTE } }))
+  const agent = parentAgent(host, leadSession([runEvent('on'), memberEvent('child-1')]))
+
+  await host.subagents.startActivation(childSpec(agent, { childId: 'child-1', name: 'coder', label: 'impl' }))
+  await host.subagents.startActivation(childSpec(agent, { childId: 'child-1', name: 'coder', label: 'impl' }))
+  await host.subagents.startActivation(childSpec(agent, { childId: 'child-1', name: 'reviewer', label: 'review impl' }))
+  await host.subagents.startActivation(childSpec(agent, { childId: 'child-1', name: 'reviewer', label: 'review impl' }))
+
+  const warns = overrideWarnings(host)
+  assert.equal(warns.length, 2, `R21：kind 参与去重键，成员与审查代码各一次，实际 ${warns.length} 次：${JSON.stringify(warns)}`)
+  assert.ok(warns.some((message) => message.includes('成员')), `R21：必须留下成员路由的痕，实际：${JSON.stringify(warns)}`)
+  assert.ok(warns.some((message) => message.includes('审查代码')), `R21：必须留下审查代码路由的痕，实际：${JSON.stringify(warns)}`)
+  assert.equal(host.notices.length, 2, `R21：notice 与 warn 同一去重口径，实际 ${host.notices.length} 条`)
+})
+
+test('R22 工作区条目存在但没配 reviewer 时回退全局 reviewer：留痕必须点名「无 reviewer 条目，取全局路由」', async () => {
+  const host = createHost({ projection: () => modelView(SESSION_ROUTE) })
+  apply(host.ctx, { reviewer: { ...REVIEWER_ROUTE }, workspaces: { [WORKSPACE_KEY]: { member: { ...MEMBER_ROUTE }, subagent: { ...SUBAGENT_ROUTE } } } })
+  const agent = parentAgent(host, leadSession([runEvent('on'), memberEvent('child-1')]))
+
+  await host.subagents.startActivation(childSpec(agent, { childId: 'child-1', name: 'reviewer', label: 'review impl' }))
+
+  assert.deepEqual(
+    forwarded(host)?.request?.agentOptions,
+    { provider: REVIEWER_ROUTE.provider, model: REVIEWER_ROUTE.model },
+    'R22：回退全局 reviewer 也必须真注入',
+  )
+  const warns = overrideWarnings(host)
+  assert.equal(warns.length, 1, `R22：必须恰好留痕一次，实际 ${warns.length} 次：${JSON.stringify(warns)}`)
+  const text = String(warns[0])
+  assert.ok(text.includes('审查代码'), `R22：kind 必须是「审查代码」，实际「${text}」`)
+  assert.ok(text.includes(WORKSPACE_KEY) && text.includes('无 reviewer 条目，取全局路由'), `R22：来源必须写明工作区没有 reviewer 条目，实际「${text}」`)
+})
+
+test('R23 两级 reviewer 都没配时留痕 kind 仍是成员：不得因为激活名字是 reviewer 就冒充审查代码覆盖', async () => {
+  const host = createHost({ projection: () => modelView(SESSION_ROUTE) })
+  apply(host.ctx, workspaceConfig({ member: { ...MEMBER_ROUTE }, subagent: { ...SUBAGENT_ROUTE } }))
+  const agent = parentAgent(host, leadSession([runEvent('on'), memberEvent('child-1')]))
+
+  await host.subagents.startActivation(childSpec(agent, { childId: 'child-1', name: 'reviewer', label: 'review impl' }))
+
+  assert.deepEqual(
+    forwarded(host)?.request?.agentOptions,
+    { provider: MEMBER_ROUTE.provider, model: MEMBER_ROUTE.model },
+    'R23：没配 reviewer 时落原本的 member 路由',
+  )
+  const warns = overrideWarnings(host)
+  assert.equal(warns.length, 1, `R23：member 覆盖必须留痕一次，实际 ${warns.length} 次：${JSON.stringify(warns)}`)
+  assert.ok(String(warns[0]).includes('成员'), `R23：kind 必须是「成员」，实际「${warns[0]}」`)
+  assert.ok(!String(warns[0]).includes('审查代码'), `R23：不得出现「审查代码」，实际「${warns[0]}」`)
 })

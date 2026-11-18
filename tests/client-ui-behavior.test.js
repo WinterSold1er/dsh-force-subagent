@@ -378,6 +378,19 @@ var CATALOG_OK = {
 
 var WORKSPACES = [{ path: '/repo/a', title: '仓库 A', workspaceId: 'w1', sessionIds: ['s1'] }];
 
+/** 三个模型才能把成员 / 子代理 / 审查三条路由区分开：两个模型时互换路由看不出来。 */
+var CATALOG3 = {
+  ok: true,
+  value: {
+    groups: [{
+      id: 'dp',
+      name: 'DeepSeek Provider',
+      models: [{ id: 'm1', name: 'Model One' }, { id: 'm2', name: 'Model Two' }, { id: 'm3', name: 'Model Three' }],
+    }],
+    failures: [],
+  },
+};
+
 test('挂载面板：工作区未选时两个模型下拉禁用，工作区下拉列出真实工作区', () => {
   const env = makeEnv({
     config: { value: { enabled: true, workspaces: {} }, revision: 1 },
@@ -486,11 +499,11 @@ test('保存走 form.mutate(三个 set op: enabled/workspaces/mode, fresh.revisi
       path: ['workspaces'],
       value: {
         '/keep': { member: { provider: 'kp', model: 'km' }, subagent: { provider: '', model: '' }, note: 'keep-me' },
-        '/repo/a': { member: { provider: 'dp', model: 'm1' }, subagent: { provider: '', model: '' } },
+        '/repo/a': { member: { provider: 'dp', model: 'm1' }, subagent: { provider: '', model: '' }, reviewer: { provider: '', model: '' } },
       },
     },
     { op: 'set', path: ['mode'], value: 'nested' },
-  ]);
+  ], '未配置审查路由时必须显式写出继承默认，不留 undefined');
   assert.equal(env.mutations[0].revision, 7, '必须带读取快照的 revision 作围栏');
 
   await settle();
@@ -499,7 +512,8 @@ test('保存走 form.mutate(三个 set op: enabled/workspaces/mode, fresh.revisi
   assert.deepEqual(plain(env.configValue().workspaces['/repo/a']), {
     member: { provider: 'dp', model: 'm1' },
     subagent: { provider: '', model: '' },
-  });
+    reviewer: { provider: '', model: '' },
+  }, '写回宿主的工作区条目必须三条路由齐全');
 });
 
 test('路由不合法时不提交：provider 有值而 model 为空则保存按钮禁用', () => {
@@ -521,6 +535,151 @@ test('路由不合法时不提交：provider 有值而 model 为空则保存按�
   assert.equal(saveButton[0].props.disabled, true, 'provider/model 不成对时不得允许保存');
   saveButton[0].props.onClick();
   assert.equal(env.mutations.length, 0, '禁用状态下点击也不得产生 mutate');
+});
+
+test('挂载面板：第三张路由卡是审查代码模型，未选工作区时它的两个下拉禁用并显示回退说明', () => {
+  const env = makeEnv({
+    config: { value: { enabled: true, workspaces: {} }, revision: 1 },
+    policy: { status: 'ready', value: { enabled: false, allowedModels: [] } },
+    workspaces: WORKSPACES,
+    catalog: CATALOG_OK,
+  });
+  const panel = env.panel();
+  panel.render();
+  const tree = panel.render();
+
+  const provider = findById(tree, 'fsx-reviewerProvider');
+  assert.equal(provider.length, 1, '审查代码模型必须有自己的 Provider 下拉');
+  assert.equal(provider[0].props.disabled, true, '未选工作区时审查路由也必须禁用，不能让人往没选中的工作区写');
+  assert.equal(findById(tree, 'fsx-reviewerModel')[0].props.disabled, true);
+
+  const hint = findById(tree, 'fsx-reviewerProvider-hint');
+  assert.equal(hint.length, 1, '审查 Provider 必须有 aria-describedby 指向的提示');
+  assert.equal(textOf(hint[0].children), '留空则回退到成员 / 子代理路由',
+    '没有全局 reviewer 时审查卡必须说「回退到成员 / 子代理路由」，沿用「继承全局默认路由」会指向不存在的旋钮');
+
+  const desc = findByText(tree, 'name="reviewer"');
+  assert.ok(desc.length >= 1, '审查卡描述必须点名 name="reviewer"，用户才知道这张卡管的是哪个成员');
+});
+
+test('审查卡继承提示：全局 reviewer 已配置时点名继承的具体模型，其它卡仍显示各自的缺省文案', () => {
+  const env = makeEnv({
+    config: { value: { enabled: true, workspaces: {}, reviewer: { provider: 'gp', model: 'gm' } }, revision: 1 },
+    policy: { status: 'ready', value: { enabled: false, allowedModels: [] } },
+    workspaces: WORKSPACES,
+    catalog: CATALOG_OK,
+  });
+  const panel = env.panel();
+  panel.render();
+  const tree = panel.render();
+
+  assert.equal(textOf(findById(tree, 'fsx-reviewerProvider-hint')[0].children),
+    '留空则继承全局默认：gp / gm', '全局 reviewer 有值时必须报出具体模型，不能只说「继承全局默认」');
+  assert.equal(textOf(findById(tree, 'fsx-memberProvider-hint')[0].children), '留空则继承全局默认路由',
+    '全局 member 没配置时成员卡仍走缺省文案');
+});
+
+test('审查路由可单独选择：只改 reviewer 不会串到成员 / 子代理，保存载荷三条路由各自独立', async () => {
+  const env = makeEnv({
+    config: { value: { enabled: true, workspaces: {} }, revision: 12 },
+    policy: { status: 'ready', value: { enabled: false, allowedModels: [] } },
+    workspaces: WORKSPACES,
+    catalog: CATALOG3,
+  });
+  const panel = env.panel();
+  panel.render();
+  await settle();
+  let tree = panel.render();
+  findById(tree, 'fsx-workspace')[0].props.onChange({ target: { value: '/repo/a' } });
+  tree = panel.render();
+  tree = panel.render();
+
+  assert.equal(findById(tree, 'fsx-reviewerProvider')[0].props.disabled, false, '选中工作区后审查路由必须可编辑');
+
+  findById(tree, 'fsx-memberProvider')[0].props.onChange({ target: { value: 'dp' } });
+  tree = panel.render();
+  findById(tree, 'fsx-memberModel')[0].props.onChange({ target: { value: 'm1' } });
+  tree = panel.render();
+  findById(tree, 'fsx-subagentProvider')[0].props.onChange({ target: { value: 'dp' } });
+  tree = panel.render();
+  findById(tree, 'fsx-subagentModel')[0].props.onChange({ target: { value: 'm3' } });
+  tree = panel.render();
+  findById(tree, 'fsx-reviewerProvider')[0].props.onChange({ target: { value: 'dp' } });
+  tree = panel.render();
+  assert.equal(findById(tree, 'fsx-reviewerModel')[0].props.value, 'm1', '换 provider 必须自动带出该 provider 的首个模型');
+  findById(tree, 'fsx-reviewerModel')[0].props.onChange({ target: { value: 'm2' } });
+  tree = panel.render();
+
+  const save = findById(tree, 'fsx-save')[0];
+  assert.equal(save.props.disabled, false, '三组路由各自成对时必须允许保存');
+  save.props.onClick();
+
+  assert.equal(env.mutations.length, 1);
+  const operations = plain(env.mutations[0].operations);
+  const written = operations.find(function (op) { return op.path.join('.') === 'workspaces'; }).value;
+  assert.deepEqual(written['/repo/a'], {
+    member: { provider: 'dp', model: 'm1' },
+    subagent: { provider: 'dp', model: 'm3' },
+    reviewer: { provider: 'dp', model: 'm2' },
+  }, '三条路由必须互不串线：审查卡改的模型不得覆盖成员或子代理路由');
+  assert.equal(env.mutations[0].revision, 12);
+});
+
+test('审查路由不成对（provider 有值而 model 为空）时保存禁用，且可见文案点名「审查代码模型」', () => {
+  const env = makeEnv({
+    config: {
+      value: {
+        enabled: true,
+        workspaces: {
+          '/repo/a': {
+            member: { provider: 'dp', model: 'm1' },
+            subagent: { provider: 'dp', model: 'm2' },
+            reviewer: { provider: 'dp', model: '' },
+          },
+        },
+      },
+      revision: 4,
+    },
+    policy: { status: 'ready', value: { enabled: false, allowedModels: [] } },
+    workspaces: WORKSPACES,
+    catalog: CATALOG_OK,
+  });
+  const panel = env.panel();
+  panel.render();
+  let tree = panel.render();
+  findById(tree, 'fsx-workspace')[0].props.onChange({ target: { value: '/repo/a' } });
+  tree = panel.render();
+  tree = panel.render();
+
+  const save = findById(tree, 'fsx-save')[0];
+  assert.equal(save.props.disabled, true, '只有审查路由不成对时也必须禁止保存——半对路由会污染宿主条目');
+  findById(tree, 'fsx-save-all')[0].props.onClick();
+  assert.equal(env.mutations.length, 0, '禁用状态下点击不得产生 mutate');
+
+  const visible = textOf(panel.render());
+  assert.ok(visible.indexOf('审查代码模型') >= 0 && visible.indexOf('成对') >= 0,
+    '三张卡共用一句不带主语的「需成对选择」会把用户支到别的路由上，可见文案必须点名是哪张卡');
+});
+
+test('策略白名单外、但全局已配的 reviewer 模型仍保留在审查下拉里，且不外泄到其它卡的下拉', async () => {
+  const env = makeEnv({
+    config: { value: { enabled: true, workspaces: {}, reviewer: { provider: 'gp', model: 'gm' } }, revision: 1 },
+    policy: { status: 'ready', value: { enabled: true, allowedModels: [{ provider: 'dp', model: 'm1' }] } },
+    workspaces: WORKSPACES,
+    catalog: CATALOG_OK,
+  });
+  const panel = env.panel();
+  panel.render();
+  await settle();
+  let tree = panel.render();
+  findById(tree, 'fsx-workspace')[0].props.onChange({ target: { value: '/repo/a' } });
+  tree = panel.render();
+  tree = panel.render();
+
+  assert.deepEqual(optionValues(findById(tree, 'fsx-reviewerProvider')[0]), ['', 'dp', 'gp'],
+    '「留空则回退」指向的全局 reviewer 必须能直接选中，否则只能手填');
+  assert.deepEqual(optionValues(findById(tree, 'fsx-memberProvider')[0]), ['', 'dp'],
+    '全局 reviewer 只属于审查卡，不得把白名单外的 provider 塞进成员卡');
 });
 
 test('侧栏常驻入口整棵树没有 onClick，会话头入口整棵树有 onClick 并切到 main 面板', () => {
@@ -576,7 +735,7 @@ test('三个会话入口注册 id 均为 force-subagent-route，main 用 key、�
     'apply 必须读自己的配置命名空间、宿主容量命名空间 subagent 与策略命名空间');
 });
 
-test('draftIsValid：成对才为真，半对为假，null 直接抛错（实现无空值防御）', () => {
+test('draftIsValid：成对才为真，半对为假，空值一律视为「全继承默认」= 合法（空值防御已落地）', () => {
   const { __test } = makeEnv({
     config: { value: { enabled: true, workspaces: {} }, revision: 1 },
     policy: { status: 'ready', value: { enabled: false, allowedModels: [] } },
@@ -592,7 +751,13 @@ test('draftIsValid：成对才为真，半对为假，null 直接抛错（实现
   assert.equal(__test.draftIsValid({ memberModel: 'm1' }), false);
   assert.equal(__test.draftIsValid({ memberProvider: 'dp', memberModel: 'm1', subagentProvider: 'sp' }), false);
   assert.equal(__test.draftIsValid({ memberProvider: 0, memberModel: 0 }), true, '非字符串按空处理 = 继承默认');
-  assert.throws(function () { __test.draftIsValid(null); }, { name: 'TypeError' });
+  // 空值语义钉死：非对象 draft = 三组全继承默认 = 合法（true），不得抛 TypeError。
+  // 与 invalidRouteLabel 同一口径（见 client-ui.test.js 的 invalidRouteLabel 用例）。
+  assert.equal(__test.draftIsValid(null), true, 'null 必须视为全继承默认 = 合法，不得抛错');
+  assert.equal(__test.draftIsValid(undefined), true, 'undefined 必须视为全继承默认 = 合法');
+  assert.equal(__test.draftIsValid('nope'), true, '非对象标量必须视为全继承默认 = 合法');
+  assert.equal(__test.invalidRouteLabel(null), '', 'null 不得谎报卡名');
+  assert.equal(__test.invalidRouteLabel(undefined), '', 'undefined 不得谎报卡名');
 });
 
 test('buildModelOptions：当前值兜底、去重、目录三态与 policy-empty 可区分', () => {

@@ -197,6 +197,7 @@ test('module.exports.__test 暴露纯逻辑给 Node 调用', () => {
     'buildSaveOperations',
     'buildWorkspacesMutation',
     'draftIsValid',
+    'invalidRouteLabel',
     'providerGroupOf',
     'routeOf',
     'routeText',
@@ -278,10 +279,53 @@ test('buildModelOptions：空策略、加载中、失败、空目录状态可区
   assert.equal(empty.status, 'empty');
 });
 
+test('buildModelOptions：current 兼容单个路由与路由数组（旧签名不破）；数组里的审查模型即使不在策略白名单也保留在候选里', () => {
+  const { __test } = loadPlugin();
+
+  const single = __test.buildModelOptions({
+    policy: { status: 'ready', value: { enabled: true, allowedModels: [{ provider: 'beta', model: 'beta-one' }] } },
+    catalog: { status: 'ready', groups: catalogGroups() },
+    current: { provider: 'legacy', model: 'legacy-model' },
+  });
+  assert.deepEqual(single.providers.map((group) => group.provider).sort(), ['beta', 'legacy'],
+    '旧的单对象 current 签名必须照常工作');
+
+  const list = __test.buildModelOptions({
+    policy: { status: 'ready', value: { enabled: true, allowedModels: [{ provider: 'beta', model: 'beta-one' }] } },
+    catalog: { status: 'ready', groups: catalogGroups() },
+    current: [
+      { provider: 'beta', model: 'beta-one' },
+      { provider: 'legacy', model: 'legacy-model' },
+      { provider: '', model: '' },
+      { provider: 'rev', model: 'rev-strong' },
+    ],
+  });
+  assert.deepEqual(list.providers.map((group) => group.provider).sort(), ['beta', 'legacy', 'rev'],
+    '已经配过的 provider/model 即使落在策略白名单外也必须留在下拉里，否则「留空回退」指向的模型选不回来');
+  assert.deepEqual(list.providers.find((group) => group.provider === 'rev').models.map((m) => m.model), ['rev-strong']);
+  assert.equal(list.providers.find((group) => group.provider === 'beta').models.length, 1, '当前值与策略重合时不得重复');
+
+  const both = __test.buildModelOptions({
+    policy: { status: 'unavailable' },
+    catalog: { status: 'ready', groups: [] },
+    current: { provider: 'a', model: 'm' },
+    currents: [{ provider: 'b', model: 'n' }],
+  });
+  assert.deepEqual(both.providers.map((group) => group.provider).sort(), ['a', 'b'], 'current 与 currents 必须都进候选');
+
+  const allEmpty = __test.buildModelOptions({
+    policy: { status: 'unavailable' },
+    catalog: { status: 'ready', groups: [] },
+    current: [{ provider: '', model: '' }, undefined, null, 'nope'],
+  });
+  assert.deepEqual(allEmpty.providers, [], '全空 / 非对象的当前值必须被丢掉，不得造出空 provider 候选组');
+  assert.equal(allEmpty.status, 'empty');
+});
+
 test('buildWorkspacesMutation：不修改入参、保留其它工作区与额外字段', () => {
   const { __test } = loadPlugin();
   const current = {
-    '/a': { member: { provider: 'old', model: 'old' }, subagent: { provider: 'old', model: 'old' }, extra: 'keep' },
+    '/a': { member: { provider: 'old', model: 'old' }, subagent: { provider: 'old', model: 'old' }, reviewer: { provider: 'keep', model: 'keep' }, extra: 'keep' },
     '/b': { member: { provider: 'other', model: 'other' } },
   };
   const next = __test.buildWorkspacesMutation(current, '/a', {
@@ -289,14 +333,35 @@ test('buildWorkspacesMutation：不修改入参、保留其它工作区与额外
     memberModel: 'alpha-fast',
     subagentProvider: '',
     subagentModel: '',
+    reviewerProvider: 'gamma',
+    reviewerModel: 'gamma-strong',
   });
   assert.notEqual(next, current);
   assert.equal(current['/a'].member.provider, 'old', 'input must not be mutated');
+  assert.equal(current['/a'].reviewer.provider, 'keep', '入参条目上的审查路由同样不得被动过');
   assert.equal(next['/a'].member.provider, 'alpha');
   assert.equal(next['/a'].member.model, 'alpha-fast');
   assert.equal(next['/a'].subagent.provider, '');
+  assert.deepEqual(next['/a'].reviewer, { provider: 'gamma', model: 'gamma-strong' },
+    '审查路由必须与成员 / 子代理写进同一条目，不能只写两条');
   assert.equal(next['/a'].extra, 'keep');
   assert.equal(next['/b'], current['/b']);
+
+  const cleared = __test.buildWorkspacesMutation(current, '/a', {
+    memberProvider: '', memberModel: '', subagentProvider: '', subagentModel: '', reviewerProvider: '', reviewerModel: '',
+  });
+  assert.deepEqual(cleared['/a'].reviewer, { provider: '', model: '' }, '空 draft 必须把审查路由显式清成继承默认，不得残留旧值');
+
+  const legacyDraft = __test.buildWorkspacesMutation(current, '/a', {
+    memberProvider: 'a', memberModel: 'm', subagentProvider: 'b', subagentModel: 'n',
+  });
+  assert.deepEqual(legacyDraft['/a'].reviewer, { provider: '', model: '' },
+    'draft 完全没提 reviewer 字段时也要补出完整路由对象，不留 undefined');
+  [undefined, null].forEach(function (draft) {
+    assert.deepEqual(__test.buildWorkspacesMutation(current, '/a', draft)['/a'],
+      { member: { provider: '', model: '' }, subagent: { provider: '', model: '' }, reviewer: { provider: '', model: '' }, extra: 'keep' },
+      'draft 是 null / undefined 时必须降级成全继承默认，不得抛错');
+  });
 });
 
 test('buildSaveOperations：两个 set op、workspaces 正确、不修改入参', () => {
@@ -305,7 +370,11 @@ test('buildSaveOperations：两个 set op、workspaces 正确、不修改入参'
     '/a': { member: { provider: 'old', model: 'old' }, subagent: { provider: 'old', model: 'old' } },
     '/b': { member: { provider: 'other', model: 'other' } },
   };
-  const draft = { memberProvider: 'alpha', memberModel: 'alpha-fast', subagentProvider: '', subagentModel: '' };
+  const draft = {
+    memberProvider: 'alpha', memberModel: 'alpha-fast',
+    subagentProvider: '', subagentModel: '',
+    reviewerProvider: 'gamma', reviewerModel: 'gamma-strong',
+  };
   const ops = __test.buildSaveOperations(current, '/a', draft, true);
   assert.equal(ops.length, 2);
   assert.deepEqual(ops[0].path, ['enabled']);
@@ -314,12 +383,16 @@ test('buildSaveOperations：两个 set op、workspaces 正确、不修改入参'
   assert.equal(ops[1].value['/a'].member.provider, 'alpha');
   assert.equal(ops[1].value['/a'].member.model, 'alpha-fast');
   assert.equal(ops[1].value['/a'].subagent.provider, '');
+  assert.deepEqual(ops[1].value['/a'].reviewer, { provider: 'gamma', model: 'gamma-strong' },
+    '保存载荷必须带上第三条审查路由');
+  assert.ok(!('reviewer' in ops[1].value['/b']), '没选中的工作区条目不得被顺手补上 reviewer 字段');
   assert.equal(ops[1].value['/b'].member.provider, 'other');
   assert.equal(current['/a'].member.provider, 'old', 'input must not be mutated');
 
   const off = __test.buildSaveOperations({}, '/x', draft, false);
   assert.equal(off[0].value, false);
   assert.equal(off[1].value['/x'].member.provider, 'alpha');
+  assert.equal(off[1].value['/x'].reviewer.provider, 'gamma');
 });
 
 test('buildWorkspacesMutation：缺少 key 时返回副本且不改动', () => {
@@ -350,14 +423,46 @@ test('workflow 纯函数：workspace key、会话反查、草稿与成对校验'
   assert.equal(__test.workspaceBySession(undefined, 's1'), null);
 
   const workspaces = {
-    '/one': { member: { provider: 'a', model: 'm' }, subagent: { provider: '', model: '' } },
+    '/one': { member: { provider: 'a', model: 'm' }, subagent: { provider: '', model: '' }, reviewer: { provider: 'r', model: 'rm' } },
+    '/two': { member: { provider: 'x', model: 'y' } },
   };
   assert.deepEqual(__test.buildDraft(workspaces, '/one'), {
     memberProvider: 'a', memberModel: 'm', subagentProvider: '', subagentModel: '',
-  });
-  assert.equal(__test.draftIsValid({ memberProvider: '', memberModel: '', subagentProvider: '', subagentModel: '' }), true);
+    reviewerProvider: 'r', reviewerModel: 'rm',
+  }, 'draft 必须同时带出成员 / 子代理 / 审查三组路由');
+  assert.deepEqual(__test.buildDraft(workspaces, '/two'), {
+    memberProvider: 'x', memberModel: 'y', subagentProvider: '', subagentModel: '',
+    reviewerProvider: '', reviewerModel: '',
+  }, '条目缺 reviewer 时必须归一成空串，不得留 undefined');
+  assert.deepEqual(__test.buildDraft(workspaces, 'missing'), {
+    memberProvider: '', memberModel: '', subagentProvider: '', subagentModel: '',
+    reviewerProvider: '', reviewerModel: '',
+  }, '未配置的键必须得到全空 draft');
+
+  assert.equal(__test.draftIsValid({ memberProvider: '', memberModel: '', subagentProvider: '', subagentModel: '', reviewerProvider: '', reviewerModel: '' }), true);
   assert.equal(__test.draftIsValid({ memberProvider: 'a', memberModel: '', subagentProvider: '', subagentModel: '' }), false);
   assert.equal(__test.draftIsValid({ memberProvider: 'a', memberModel: 'm', subagentProvider: 'b', subagentModel: 'n' }), true);
+  assert.equal(__test.draftIsValid({ memberProvider: 'a', memberModel: 'm', reviewerProvider: 'r' }), false,
+    '审查路由 provider 有值而 model 为空时必须判非法');
+  assert.equal(__test.draftIsValid({ reviewerModel: 'rm' }), false, '只填审查 model 不填 provider 同样非法');
+  assert.equal(__test.draftIsValid({ memberProvider: 'a', memberModel: 'm', subagentProvider: 'b', subagentModel: 'n', reviewerProvider: 'r', reviewerModel: 'rm' }), true,
+    '三组各自成对即为合法，不要求三组互相一致');
+
+  assert.equal(__test.invalidRouteLabel({ memberProvider: 'a', memberModel: 'm', subagentProvider: '', subagentModel: '', reviewerProvider: 'r' }), '审查代码模型',
+    '禁用提示必须点名不成对的那张卡，三张卡共用一句不带主语的原因会把用户支到别的路由上');
+  assert.equal(__test.invalidRouteLabel({ memberProvider: 'a', subagentProvider: '', subagentModel: '' }), '成员模型', '报第一组不成对的卡');
+  assert.equal(__test.invalidRouteLabel({ memberProvider: '', memberModel: 'm', subagentProvider: 'b', subagentModel: 'n' }), '成员模型');
+  assert.equal(__test.invalidRouteLabel({ memberProvider: '', memberModel: '', reviewerProvider: 'r', reviewerModel: 'rm' }), '', '全空 + 审查成对时必须合法');
+  assert.equal(__test.invalidRouteLabel({}), '', '空 draft = 三组都继承默认，必须合法');
+  // 空值防御（不是缺陷的期望值）：null / undefined / 非对象一律视为「三组都继承默认」= 合法，
+  // 返回 ''，不抛 TypeError、也不谎报某张卡的名字。与 routeOf / buildWorkspacesMutation 同口径。
+  assert.equal(__test.invalidRouteLabel(null), '', 'null 必须视为全继承默认 = 合法，且不得抛错');
+  assert.equal(__test.invalidRouteLabel(undefined), '', 'undefined 必须视为全继承默认 = 合法');
+  assert.equal(__test.invalidRouteLabel('nope'), '', '非对象标量必须视为全继承默认 = 合法');
+  assert.equal(__test.invalidRouteLabel(42), '', '数字 draft 必须视为全继承默认 = 合法');
+  assert.equal(__test.draftIsValid(null), true, 'draftIsValid 的空值语义必须与 invalidRouteLabel 一致');
+  assert.equal(__test.draftIsValid(undefined), true, 'draftIsValid 的空值语义必须与 invalidRouteLabel 一致');
+  assert.equal(__test.draftIsValid('nope'), true, 'draftIsValid 的空值语义必须与 invalidRouteLabel 一致');
 });
 
 test('readWorkspaceState：服务抛错返回错误态且只 warn 一次', () => {
@@ -427,6 +532,24 @@ test('client.js 不再有模型文本框，也不硬编码模型清单', () => {
 
 test('save 使用 form.mutate(operations, fresh.revision) 做 revision 围栏', () => {
   assert.match(CODE, /form\.mutate\(operations,\s*fresh\.revision\)/);
+});
+
+test('三张路由卡：审查代码模型卡的控件、继承提示与卡片描述齐备', () => {
+  assert.match(CODE, /function renderRouteCard\(title, description, options, inheritedRoute, providerField, modelField, emptyHint\)/,
+    'renderRouteCard 必须支持可选 emptyHint，缺省仍是「留空则继承全局默认路由」');
+  assert.match(CODE, /'留空则继承全局默认路由'/, '成员 / 子代理卡的缺省提示不得丢');
+  assert.match(CODE, /'留空则回退到成员 \/ 子代理路由'/,
+    '审查卡的回退说明必须点名「成员 / 子代理路由」，沿用「继承全局默认」会把用户指向错的旋钮');
+  const cards = CODE.match(/renderRouteCard\('/g) || [];
+  assert.equal(cards.length, 3, '成员 / 子代理 / 审查必须各有一张路由卡，不多不少');
+  assert.match(CODE, /renderRouteCard\('审查代码模型'[\s\S]{0,600}?'reviewerProvider', 'reviewerModel'/,
+    '审查卡必须绑定 reviewerProvider / reviewerModel 两个字段');
+  assert.match(CODE, /inherited\.reviewer, 'reviewerProvider'/, '审查卡的继承提示必须取 inherited.reviewer');
+  assert.match(CODE, /reviewer: routeOf\(value\.reviewer\)/, 'inherited 必须含全局 reviewer 路由');
+  assert.match(CODE, /var reviewerOptions = buildModelOptions\(\{[\s\S]{0,400}?inherited\.reviewer,/,
+    '审查下拉的 current 必须并入 inherited.reviewer，全局已配的审查模型要能直接选中');
+  assert.match(CODE, /className: 'fsx-cards'/, '新增卡片仍必须在 .fsx-cards 栅格容器内');
+  assert.doesNotMatch(CODE, /type:\s*'text'/, '新卡也不能退化成手填输入框');
 });
 
 test('client.js 的样式与可访问性硬性要求存在', () => {
@@ -587,10 +710,10 @@ test('字阶分三级：11 辅助 / 13 正文 / 20 标题，卡标题 14 与 lab
   assert.ok(distinct.size >= 4, '同一页面上至少要有 4 个可区分的字号，不能只靠字重：' + [...distinct].join('/'));
 });
 
-test('buildAllWorkspacesMutation：入参一字不改，返回既有键∪枚举键，只替换 member/subagent 并保留条目上的其它字段', () => {
+test('buildAllWorkspacesMutation：入参一字不改，返回既有键∪枚举键，只替换 member/subagent/reviewer 并保留条目上的其它字段', () => {
   const { __test } = loadPlugin();
   const current = {
-    '/a': { member: { provider: 'old', model: 'old' }, subagent: { provider: 'old', model: 'old' }, extra: 'keep-a' },
+    '/a': { member: { provider: 'old', model: 'old' }, subagent: { provider: 'old', model: 'old' }, reviewer: { provider: 'old', model: 'old' }, extra: 'keep-a' },
     '/b': { member: { provider: 'x', model: 'y' }, note: 'keep-b' },
     '/only-config': { member: { provider: 'z', model: 'w' }, note: 'legacy' },
   };
@@ -600,7 +723,11 @@ test('buildAllWorkspacesMutation：入参一字不改，返回既有键∪枚举
     { path: '/c' },
     { path: '', workspaceId: 'w3' },
   ];
-  const draft = { memberProvider: 'alpha', memberModel: 'alpha-fast', subagentProvider: 'beta', subagentModel: 'beta-slow' };
+  const draft = {
+    memberProvider: 'alpha', memberModel: 'alpha-fast',
+    subagentProvider: 'beta', subagentModel: 'beta-slow',
+    reviewerProvider: 'gamma', reviewerModel: 'gamma-strong',
+  };
 
   const next = __test.buildAllWorkspacesMutation(current, items, draft);
 
@@ -613,10 +740,11 @@ test('buildAllWorkspacesMutation：入参一字不改，返回既有键∪枚举
 
   const ROUTE_MEMBER = { provider: 'alpha', model: 'alpha-fast' };
   const ROUTE_SUBAGENT = { provider: 'beta', model: 'beta-slow' };
-  assert.deepEqual(next['/a'], { member: ROUTE_MEMBER, subagent: ROUTE_SUBAGENT, extra: 'keep-a' },
-    '已存在的条目只能换掉两条路由，未知字段必须原样留着');
-  assert.deepEqual(next['/c'], { member: ROUTE_MEMBER, subagent: ROUTE_SUBAGENT }, '没配置过的枚举工作区必须被新建出来');
-  assert.deepEqual(next['w3'], { member: ROUTE_MEMBER, subagent: ROUTE_SUBAGENT },
+  const ROUTE_REVIEWER = { provider: 'gamma', model: 'gamma-strong' };
+  assert.deepEqual(next['/a'], { member: ROUTE_MEMBER, subagent: ROUTE_SUBAGENT, reviewer: ROUTE_REVIEWER, extra: 'keep-a' },
+    '已存在的条目只能换掉三条路由，未知字段必须原样留着');
+  assert.deepEqual(next['/c'], { member: ROUTE_MEMBER, subagent: ROUTE_SUBAGENT, reviewer: ROUTE_REVIEWER }, '没配置过的枚举工作区必须被新建出来');
+  assert.deepEqual(next['w3'], { member: ROUTE_MEMBER, subagent: ROUTE_SUBAGENT, reviewer: ROUTE_REVIEWER },
     'path 为空的条目按 workspaceId 兜底成键（与 workspaceKeyOf 同语义）');
   assert.deepEqual(next['/b'], current['/b'], '没被枚举到的既有条目不得被动过');
   assert.deepEqual(next['/only-config'], current['/only-config'], '只存在于配置里的工作区不得被广播抹掉');
@@ -628,26 +756,32 @@ test('buildAllWorkspacesMutation：缺失字段补全成完整路由、空 draft
   const partial = __test.buildAllWorkspacesMutation(
     { '/a': { member: { provider: 'keep', model: 'keep' } } },
     [{ path: '/a' }],
-    { memberProvider: 'alpha', memberModel: 'alpha-fast' },
+    { memberProvider: 'alpha', memberModel: 'alpha-fast', reviewerProvider: 'gamma' },
   );
   assert.deepEqual(partial['/a'], {
     member: { provider: 'alpha', model: 'alpha-fast' },
     subagent: { provider: '', model: '' },
-  }, '条目缺 subagent、draft 缺 subagent 字段时必须补成完整路由，不能留 undefined');
+    reviewer: { provider: 'gamma', model: '' },
+  }, '条目缺 subagent/reviewer、draft 缺字段时必须补成完整路由对象，不能留 undefined（provider 有值而 model 空是 draftIsValid 的事，这里只保结构）');
 
   const cleared = __test.buildAllWorkspacesMutation(
-    { '/a': { member: { provider: 'old', model: 'old' }, subagent: { provider: 'old', model: 'old' } } },
+    { '/a': { member: { provider: 'old', model: 'old' }, subagent: { provider: 'old', model: 'old' }, reviewer: { provider: 'old', model: 'old' } } },
     [{ path: '/a' }],
     {},
   );
-  assert.deepEqual(cleared['/a'], { member: { provider: '', model: '' }, subagent: { provider: '', model: '' } },
-    '空 draft 必须显式写成继承默认，而不是残留旧值');
+  assert.deepEqual(cleared['/a'], { member: { provider: '', model: '' }, subagent: { provider: '', model: '' }, reviewer: { provider: '', model: '' } },
+    '空 draft 必须把三条路由都显式写成继承默认，而不是残留旧值');
 
   const current = { '/a': { member: { provider: 'x', model: 'y' } } };
   for (const items of [[], undefined, null, 'nope', [null, {}, { workspaceId: '' }]]) {
     const next = __test.buildAllWorkspacesMutation(current, items, { memberProvider: 'a', memberModel: 'b' });
     assert.deepEqual(Object.keys(next).sort(), ['/a'], '枚举不到任何键时不得新增工作区，也不得抛错');
     assert.equal(next['/a'], current['/a'], '没被枚举到的条目必须原样保留（同一个引用即可，别做无用深拷贝）');
+  }
+  for (const draft of [undefined, null]) {
+    const next = __test.buildAllWorkspacesMutation(current, [{ path: '/a' }], draft);
+    assert.deepEqual(next['/a'], { member: { provider: '', model: '' }, subagent: { provider: '', model: '' }, reviewer: { provider: '', model: '' } },
+      'draft 是 null / undefined 时广播也必须写三条继承默认路由，不得抛错或留 undefined');
   }
 });
 

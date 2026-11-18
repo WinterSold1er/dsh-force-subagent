@@ -14,8 +14,11 @@
  *   零任务成员（刚 spawn）NOT finished。
  * - 软门禁形态（task-22）：不返回 deny，处理器调用 next() 放行，同时向调用方会话 inject 一条 notice；
  *   notice 正文前缀 `[team-gate] TEAM_MEMBER_FINISHED:`，文案给出解法（subagent 新建成员）。同一会话同一成员只投递一次。
- * - 拦（改为提醒）send_message(target) 与 team_task_update(action=claim 调用者自身 / action=reassign owner)；
+ * - 拦（改为提醒）send_message({ agent }) 与 team_task_update(action=claim 调用者自身 / action=reassign owner)；
+ *   rc.2 的 send_message 参数是 { agent: 成员名, message }（旧的 target / agent_id 已删除）；
  *   reopen 不提醒；非成员 target 不提醒；读不到 team 状态 → fail-open 放行 + warn 且不提醒。
+ * - 门禁只在 caps.board 档启用（有 team_task_create）：替身必须同时提供 tools 服务与本步 toolSet，
+ *   否则 rc.2 契约按 standard 降级，本门禁整体停用。
  * - interrupt_agent 不在拦的范围：Lead 收敛已完成成员靠它（见 flat 提示词与 mode-flat.test.js B2）。
  *
  * 运行：node --test tests/member-finished-gate.test.js
@@ -70,6 +73,19 @@ function createCommands() {
   return { registered, register: (definition) => { registered.push(definition) } }
 }
 
+/**
+ * rc.2 team 档工具面：section / 门禁按本步 toolSet 探测真实工具。
+ * 有 team_task_create 才会启用「已完成成员」门禁（caps.board），缺了它整条链路按 standard 停用。
+ */
+const TOOL_SET = Object.freeze({ step: 'test' })
+const TEAM_TOOL_NAMES = [
+  'subagent', 'subagent_fork', 'workflow',
+  'team_task_create', 'team_task_update', 'team_task_list', 'interrupt_agent',
+  'send_message', 'list_agents', 'wait_agent', 'todo_write',
+  'read', 'grep', 'glob', 'write', 'edit', 'bash',
+]
+const createTools = () => ({ definitions: () => TEAM_TOOL_NAMES.map((name) => ({ name })) })
+
 function createHost({ agentTeams } = {}) {
   const onCalls = []
   const warnings = []
@@ -84,7 +100,9 @@ function createHost({ agentTeams } = {}) {
     get: (service) => (
       service === 'systemPrompt' ? createSystemPrompt()
         : service === 'commands' ? createCommands()
-        : service === 'agentTeams' ? agentTeams : undefined
+          : service === 'agentTeams' ? agentTeams
+            : service === 'tools' ? createTools()
+              : undefined
     ),
     on: (...args) => {
       onCalls.push(args)
@@ -134,6 +152,7 @@ const execOf = (name, agent, args = {}) => ({
   name,
   arguments: args,
   agent,
+  toolSet: TOOL_SET,
   signal: new AbortController().signal,
 })
 
@@ -254,13 +273,13 @@ const REOPENED = [
 const leadSender = (events) => agentOf(membershipOf({ role: 'lead', name: 'lead', events }))
 const memberSender = (events) => agentOf(membershipOf({ name: 'worker-2', events }), [], 'm2')
 
-test('用例 1：成员 A 名下 task 已 completed → send_message(target=A) 被 deny 且文案给出新成员解法', async (t) => {
+test('用例 1：成员 A 名下 task 已 completed → send_message({ agent: A }) 放行并提醒（文案给出新成员解法）', async (t) => {
   for (const mode of ['flat', 'nested']) {
     await t.test(`${mode} / Lead 发给已完成成员`, async () => {
       const host = hostFor({ mode })
       const { decisions, threw, nextCalls, handlerCount, notices } = await gateOutcome(
         host,
-        execOf('send_message', leadSender(FINISHED), { target: 'worker-1', message: '再改一轮' }),
+        execOf('send_message', leadSender(FINISHED), { agent: 'worker-1', message: '再改一轮' }),
       )
       assertFinishedReminded({ threw, decisions, nextCalls, handlerCount, notices, tool: 'send_message', label: `${mode} 已完成成员 target` })
     })
@@ -269,7 +288,7 @@ test('用例 1：成员 A 名下 task 已 completed → send_message(target=A) �
     const host = hostFor({ mode: 'flat' })
     const { decisions, threw, nextCalls, handlerCount, notices } = await gateOutcome(
       host,
-      execOf('send_message', memberSender(FINISHED), { target: 'worker-1', message: '帮我接着做' }),
+      execOf('send_message', memberSender(FINISHED), { agent: 'worker-1', message: '帮我接着做' }),
     )
     assertFinishedReminded({ threw, decisions, nextCalls, handlerCount, notices, tool: 'send_message', label: 'flat 成员 sender' })
   })
@@ -282,7 +301,7 @@ test('用例 2：completed + in_progress 同时存在 → 不算 finished，放�
       const agent = mode === 'flat' ? memberSender(MIXED) : leadSender(MIXED)
       const { decisions, threw, nextCalls, handlerCount, notices } = await gateOutcome(
         host,
-        execOf('send_message', agent, { target: 'worker-1', message: '继续' }),
+        execOf('send_message', agent, { agent: 'worker-1', message: '继续' }),
       )
       assertAllowed({ threw, decisions, nextCalls, handlerCount, notices, tool: 'send_message', label: '名下仍有活跃任务' })
     })
@@ -293,23 +312,23 @@ test('用例 3：成员 A 零任务（刚 spawn 未派活）→ 放行', async (
   const host = hostFor({ mode: 'flat' })
   const { decisions, threw, nextCalls, handlerCount, notices } = await gateOutcome(
     host,
-    execOf('send_message', leadSender(SPAWNED_NO_TASKS), { target: 'worker-1', message: '给你派活' }),
+    execOf('send_message', leadSender(SPAWNED_NO_TASKS), { agent: 'worker-1', message: '给你派活' }),
   )
   assertAllowed({ threw, decisions, nextCalls, handlerCount, notices, tool: 'send_message', label: '零任务成员' })
 })
 
-test('用例 4：成员 A 任务已 deleted → 视为 finished，deny', async () => {
+test('用例 4：成员 A 任务已 deleted → 视为 finished，放行并提醒', async () => {
   const host = hostFor({ mode: 'flat' })
   const { decisions, threw, nextCalls, handlerCount, notices } = await gateOutcome(
     host,
-    execOf('send_message', leadSender(FINISHED_DELETED), { target: 'worker-1', message: '补一个改动' }),
+    execOf('send_message', leadSender(FINISHED_DELETED), { agent: 'worker-1', message: '补一个改动' }),
   )
   assertFinishedReminded({ threw, decisions, nextCalls, handlerCount, notices, tool: 'send_message', label: 'deleted 任务' })
 })
 
-test('用例 5：team_task_update claim —— 已完成成员自身被 deny，未完成成员放行', async (t) => {
+test('用例 5：team_task_update claim —— 已完成成员自身放行并提醒，未完成成员放行', async (t) => {
   for (const mode of ['flat', 'nested']) {
-    await t.test(`${mode} / 已完成成员 claim 新任务被 deny`, async () => {
+    await t.test(`${mode} / 已完成成员 claim 新任务 → 放行并提醒`, async () => {
       const host = hostFor({ mode })
       const claimer = agentOf(membershipOf({ name: 'worker-1', events: FINISHED }), [], 'm1')
       const { decisions, threw, nextCalls, handlerCount, notices } = await gateOutcome(
@@ -334,7 +353,7 @@ test('用例 5：team_task_update claim —— 已完成成员自身被 deny，�
   }
 })
 
-test('用例 6：team_task_update reassign 指向已完成成员 → deny', async (t) => {
+test('用例 6：team_task_update reassign 指向已完成成员 → 放行并提醒', async (t) => {
   for (const mode of ['flat', 'nested']) {
     await t.test(mode, async () => {
       const host = hostFor({ mode })
@@ -353,7 +372,7 @@ test('用例 6：team_task_update reassign 指向已完成成员 → deny', asyn
   }
 })
 
-test('用例 7：reopen 本身放行；reopen 后已完成成员再 claim 仍被 deny', async (t) => {
+test('用例 7：reopen 本身放行；reopen 后已完成成员再 claim 仍被提醒', async (t) => {
   await t.test('reopen 不拦', async () => {
     const host = hostFor({ mode: 'flat' })
     const { decisions, threw, nextCalls, handlerCount, notices } = await gateOutcome(
@@ -362,7 +381,7 @@ test('用例 7：reopen 本身放行；reopen 后已完成成员再 claim 仍被
     )
     assertAllowed({ threw, decisions, nextCalls, handlerCount, notices, tool: 'team_task_update', label: 'reopen' })
   })
-  await t.test('reopen 之后该成员 claim 仍被拦', async () => {
+  await t.test('reopen 之后该成员 claim 仍被提醒', async () => {
     const host = hostFor({ mode: 'flat' })
     const claimer = agentOf(membershipOf({ name: 'worker-1', events: REOPENED }), [], 'm1')
     const { decisions, threw, nextCalls, handlerCount, notices } = await gateOutcome(
@@ -378,7 +397,7 @@ test('用例 8：非成员 target 与 interrupt_agent 不受影响 → 放行', 
     const host = hostFor({ mode: 'flat' })
     const { decisions, threw, nextCalls, handlerCount, notices } = await gateOutcome(
       host,
-      execOf('send_message', memberSender(FINISHED), { target: 'lead', message: '结果交回 Lead' }),
+      execOf('send_message', memberSender(FINISHED), { agent: 'lead', message: '结果交回 Lead' }),
     )
     assertAllowed({ threw, decisions, nextCalls, handlerCount, notices, tool: 'send_message', label: 'target=lead' })
   })
@@ -386,11 +405,11 @@ test('用例 8：非成员 target 与 interrupt_agent 不受影响 → 放行', 
     const host = hostFor({ mode: 'flat' })
     const { decisions, threw, nextCalls, handlerCount, notices } = await gateOutcome(
       host,
-      execOf('send_message', leadSender(FINISHED), { target: 'ghost-9', message: 'x' }),
+      execOf('send_message', leadSender(FINISHED), { agent: 'ghost-9', message: 'x' }),
     )
     assertAllowed({ threw, decisions, nextCalls, handlerCount, notices, tool: 'send_message', label: 'target 未知' })
   })
-  await t.test('interrupt_agent 收敛已完成成员不在拦的范围', async () => {
+  await t.test('interrupt_agent 收敛已完成成员不在提醒范围', async () => {
     const host = hostFor({ mode: 'flat' })
     const { decisions, threw, nextCalls, handlerCount, notices } = await gateOutcome(
       host,
@@ -403,7 +422,7 @@ test('用例 8：非成员 target 与 interrupt_agent 不受影响 → 放行', 
     const subagent = { session: { snapshotEvents: () => [] }, membership: undefined, header: { delegationDepth: 1 } }
     const { decisions, threw, nextCalls, handlerCount, notices } = await gateOutcome(
       host,
-      execOf('send_message', subagent, { target: 'worker-1', message: 'x' }),
+      execOf('send_message', subagent, { agent: 'worker-1', message: 'x' }),
     )
     assertAllowed({ threw, decisions, nextCalls, handlerCount, notices, tool: 'send_message', label: 'subagent sender' })
   })
@@ -423,7 +442,7 @@ test('用例 9：读不到 team 状态 → fail-open 放行并 warn，不把异�
     }
     const { decisions, threw, nextCalls, handlerCount, warnings, notices } = await gateOutcome(
       host,
-      execOf('send_message', exploding, { target: 'worker-1', message: 'x' }),
+      execOf('send_message', exploding, { agent: 'worker-1', message: 'x' }),
     )
     assertAllowed({ threw, decisions, nextCalls, handlerCount, notices, tool: 'send_message', label: '事件读取抛错' })
     assert.equal(warnings.length, 1, `fail-open 必须只 warn 一次，实际 ${warnings.length} 次：${warnings.join(' | ')}`)
@@ -435,7 +454,7 @@ test('用例 9：读不到 team 状态 → fail-open 放行并 warn，不把异�
     apply(host.ctx, { mode: 'flat' })
     const { decisions, threw, nextCalls, handlerCount, warnings, notices } = await gateOutcome(
       host,
-      execOf('send_message', leadSender(FINISHED), { target: 'worker-1', message: 'x' }),
+      execOf('send_message', leadSender(FINISHED), { agent: 'worker-1', message: 'x' }),
     )
     assertAllowed({ threw, decisions, nextCalls, handlerCount, notices, tool: 'send_message', label: '服务缺失' })
     assert.equal(warnings.length, 1, `服务缺失必须只 warn 一次，实际 ${warnings.length} 次：${warnings.join(' | ')}`)
@@ -500,7 +519,7 @@ test('用例 11：/using-agent-team off 时本门禁完全不干预（与其余�
       }
       const { decisions, threw, nextCalls, handlerCount, notices } = await gateOutcome(
         host,
-        execOf('send_message', agent, { target: 'worker-1', message: 'off 状态下的复用' }),
+        execOf('send_message', agent, { agent: 'worker-1', message: 'off 状态下的复用' }),
       )
       assertAllowed({ threw, decisions, nextCalls, handlerCount, notices, tool: 'send_message', label: 'off + 已完成成员' })
     })

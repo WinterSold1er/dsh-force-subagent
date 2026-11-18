@@ -51,6 +51,14 @@ function createHost({ systemPrompt = createSystemPrompt(), commands = createComm
   return { ctx, warnings, onCalls, systemPrompt, commands, agentTeams }
 }
 
+/**
+ * rc.2 契约：text() 按本步 toolSet + ctx.tools 探测能力面，本文件的 fake ctx 没有 tools 服务，
+ * 因此按 standard 档降级并额外 warn 一条「工具面探测降级」。
+ * 所以 warn 断言一律按文案过滤，不能再拿 warnings.length 当总数比较。
+ */
+const TOOL_PROBE_FALLBACK = /工具面探测降级/
+const relevantWarnings = (host) => host.warnings.filter((warning) => !TOOL_PROBE_FALLBACK.test(warning))
+
 const runEvent = (name, args) => ({
   type: 'command/run',
   data: args === undefined ? { name } : { name, args },
@@ -68,7 +76,7 @@ test('apply 注册命令与 systemPrompt section，声明 inject、不监听 age
   apply(host.ctx)
 
   assert.equal(plugin.name, 'force-subagent')
-  assert.deepEqual(plugin.inject, ['commands', 'systemPrompt', 'subagents'], '必须声明 inject 让 Cordis 门控 apply')
+  assert.deepEqual(plugin.inject, ['commands', 'systemPrompt', 'subagents', 'tools'], '必须声明 inject（rc.2 增加 tools，用于按本步 toolSet 探测真实工具面）让 Cordis 门控 apply')
 
   const section = sectionOf(host)
   assert.equal(section.name, 'force-subagent:agent-team')
@@ -117,7 +125,7 @@ test('最后一条 using-agent-team 记录为 on/task：text 非空', () => {
   const text = textFor(host, { events: [runEvent('using-agent-team', 'on')] })
   assert.ok(text.length > 0)
   assert.match(text, /Agent-Team/)
-  assert.match(text, /team_task_create/)
+  assert.match(text, /subagent/, 'fake ctx 无 tools 服务 → rc.2 standard 档，Lead nudge 仍必须点名委派工具')
 })
 
 test('未带 args（直接 /using-agent-team）：视为开启', () => {
@@ -184,13 +192,15 @@ test('会话形状异常：返回空串且 logger.warn 记录异常（不空 cat
   const host = createHost()
   apply(host.ctx)
   assert.equal(textFor(host, { events: 'not-an-array' }), '')
-  assert.equal(host.warnings.length, 1)
-  assert.match(host.warnings[0], /读取会话事件失败/)
+  const readErrors = relevantWarnings(host)
+  assert.equal(readErrors.length, 1, `会话读取异常必须 warn 一次：${host.warnings.join(' | ')}`)
+  assert.match(readErrors[0], /读取会话事件失败/)
 
   const throwing = { snapshotEvents: () => { throw new Error('snapshot exploded') } }
   assert.equal(textFor(host, throwing), '')
-  assert.equal(host.warnings.length, 2)
-  assert.match(host.warnings[1], /snapshot exploded/)
+  const thrownWarns = relevantWarnings(host)
+  assert.equal(thrownWarns.length, 2, `两次读取异常必须各 warn 一次：${host.warnings.join(' | ')}`)
+  assert.match(thrownWarns[1], /snapshot exploded/)
 })
 
 test('无 session 上下文：返回空串且不告警', () => {
@@ -239,14 +249,16 @@ test('Lead 身份（role=lead）仍按自身会话门控，注入 Lead 版提醒
     session: { events: [runEvent('using-agent-team')] },
     membership: { role: 'lead', root: { session: { events: [] } } },
   }
-  assert.match(sectionOf(host).text({ agent }), /team_task_create/)
+  const text = sectionOf(host).text({ agent })
+  assert.match(text, /Lead/)
+  assert.match(text, /不要独自实现|subagent/, 'Lead 版提醒必须要求委派而不是自己实现')
 })
 
 test('成员：无 agentTeams 服务时退回本会话门控，不误判为成员', () => {
   const host = createHost()
   apply(host.ctx)
   const text = sectionOf(host).text({ agent: { session: { events: [runEvent('using-agent-team')] } } })
-  assert.match(text, /team_task_create/)
+  assert.match(text, /subagent/, '退回本会话门控后注入的仍是 Lead 版委派提醒')
 })
 
 test('成员：Lead 会话读取异常 → warn 且不注入', () => {
@@ -260,8 +272,9 @@ test('成员：Lead 会话读取异常 → warn 且不注入', () => {
     },
   }
   assert.equal(sectionOf(host).text({ agent }), '')
-  assert.equal(host.warnings.length, 1)
-  assert.match(host.warnings[0], /lead snapshot exploded/)
+  const leadWarns = relevantWarnings(host)
+  assert.equal(leadWarns.length, 1, `只许 warn 一次：${host.warnings.join(' | ')}`)
+  assert.match(leadWarns[0], /lead snapshot exploded/)
 })
 
 test('命令撞名 already registered：warn 含命令名与修复步骤，section 仍注册', () => {
@@ -333,10 +346,13 @@ test('section 文本：开启带 task 时追加任务段并保留 Lead 指令', 
   const host = createHost()
   apply(host.ctx)
   const text = textFor(host, { events: [runEvent('using-agent-team', '写一个解析器')] })
-  assert.match(text, /team_task_create/, '任务段不得顶掉 Lead 指令')
+  assert.match(text, /本会话已启用 Agent-Team 强制委派提示/, '任务段不得顶掉 Lead 指令')
   assert.match(text, /本会话任务/)
   assert.ok(text.includes('写一个解析器'), 'section 必须持久携带任务原文')
-  assert.ok(text.indexOf('本会话任务') > text.indexOf('team_task_create'), '任务段必须跟在 nudge 之后')
+  assert.ok(
+    text.indexOf('本会话任务') > text.indexOf('本会话已启用 Agent-Team 强制委派提示'),
+    '任务段必须跟在 nudge 之后',
+  )
 })
 
 test('section 文本：开启无 task 与关闭时都不出现任务段', () => {

@@ -65,6 +65,15 @@ function gateHandler(host) {
   return handlers[0]
 }
 
+/**
+ * 新契约把 warn 分成两路，必须分开断言（互不吞并、各自 warn-once）：
+ * - 工具面探测降级：[force-subagent] …，工具面探测降级为标准委派文案…（每次 apply 至多一条）；
+ * - 门禁 fail-open：…，门禁未生效，本次放行「<tool>」。
+ */
+const PROBE_WARN = /工具面探测降级/
+const probeWarnings = (host) => host.warnings.filter((message) => PROBE_WARN.test(message))
+const gateWarnings = (host) => host.warnings.filter((message) => !PROBE_WARN.test(message))
+
 const throwingTeams = () => ({
   tryMembership: () => {
     throw new Error('membership exploded')
@@ -77,8 +86,11 @@ test('agentTeams 服务缺失：门禁降级必须 warn，且文本点名 agentT
 
   await gateHandler(host)({ agent: { id: 'mate-1', session: { events: [] } }, name: 'bash' }, () => undefined)
 
-  assert.equal(host.warnings.length, 1, 'agentTeams 缺失必须产生恰好一条 warn')
-  assert.match(host.warnings[0], /agentTeams|门禁未生效/)
+  // 新契约：探测不到 tools 服务时先 warn 一条「工具面降级」，门禁 fail-open 再 warn 一条；两条都必须存在且各只一条。
+  assert.equal(probeWarnings(host).length, 1, '探测降级每次 apply 只允许 warn 一次')
+  const gate = gateWarnings(host)
+  assert.equal(gate.length, 1, 'agentTeams 缺失必须产生恰好一条门禁 warn')
+  assert.match(gate[0], /agentTeams|门禁未生效/)
 })
 
 test('tryMembership 抛错：warn 文本必须包含被拦工具名与异常原因（不空 catch）', async () => {
@@ -87,9 +99,10 @@ test('tryMembership 抛错：warn 文本必须包含被拦工具名与异常原�
 
   await gateHandler(host)({ agent: { id: 'mate-2' }, name: 'bash' }, () => undefined)
 
-  assert.equal(host.warnings.length, 1, '门禁评估失败必须产生恰好一条 warn')
-  assert.match(host.warnings[0], /bash/, 'warn 文本必须包含工具名')
-  assert.match(host.warnings[0], /membership exploded/, 'warn 文本必须保留异常原因')
+  const gate = gateWarnings(host)
+  assert.equal(gate.length, 1, '门禁评估失败必须产生恰好一条 warn')
+  assert.match(gate[0], /bash/, 'warn 文本必须包含工具名')
+  assert.match(gate[0], /membership exploded/, 'warn 文本必须保留异常原因')
 })
 
 test('同一降级条件连续触发两次：warn 计数仍为 1（防刷屏）', async () => {
@@ -101,6 +114,8 @@ test('同一降级条件连续触发两次：warn 计数仍为 1（防刷屏）'
   await handler(exec, () => undefined)
   await handler(exec, () => undefined)
 
-  assert.equal(host.warnings.length, 1, '同一条件反复触发只允许 warn 一次')
-  assert.match(host.warnings[0], /bash/)
+  // 两次调用：探测降级与门禁 fail-open 各自仍然只有一条（两个独立 warn-once 都不得逐次刷屏）。
+  assert.equal(probeWarnings(host).length, 1, '探测降级条件反复触发只允许 warn 一次')
+  assert.equal(gateWarnings(host).length, 1, '同一门禁降级条件反复触发只允许 warn 一次')
+  assert.match(gateWarnings(host)[0], /bash/)
 })

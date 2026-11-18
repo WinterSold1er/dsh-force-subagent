@@ -45,6 +45,19 @@ function agentOf({ id = ROOT_ID, name, depth = 0, events = [runEvent('on')] } = 
 }
 
 /**
+ * rc.2 team 档工具面：section / 门禁按本步 toolSet 探测真实工具。
+ * 缺 tools 服务或 toolSet 时 rc.2 契约走 standard 降级（warn 一次、看板类门禁停用），旧断言就测不到真实档位。
+ */
+const TOOL_SET = Object.freeze({ step: 'test' })
+const TEAM_TOOL_NAMES = [
+  'subagent', 'subagent_fork', 'workflow',
+  'team_task_create', 'team_task_update', 'team_task_list', 'interrupt_agent',
+  'send_message', 'list_agents', 'wait_agent', 'todo_write',
+  'read', 'grep', 'glob', 'write', 'edit', 'bash',
+]
+const createTools = () => ({ definitions: () => TEAM_TOOL_NAMES.map((name) => ({ name })) })
+
+/**
  * rc.2 形状宿主：agentTeams 服务在但没有 tryMembership，subagents 服务提供 rootOf / resolveName / volatile 容量字段，
  * settings 记录每一次写入用于「不得写 agent-team 命名空间」的断言。
  */
@@ -58,8 +71,9 @@ function createHost({ subagents, agentTeams = { isEnabled: () => true }, mode } 
         : service === 'commands' ? { register: () => () => {} }
           : service === 'agentTeams' ? agentTeams
             : service === 'subagents' ? subagents
-              : service === 'settings' ? settings
-                : undefined
+              : service === 'tools' ? createTools()
+                : service === 'settings' ? settings
+                  : undefined
     ),
     on: (...args) => { ctx.onCalls.push(args) },
     onCalls: [],
@@ -114,6 +128,7 @@ const execOf = (name, agent, args = {}) => ({
   name,
   arguments: args,
   agent,
+  toolSet: TOOL_SET,
   signal: new AbortController().signal,
 })
 
@@ -274,11 +289,11 @@ test('finishedMembers：名下还有未完成任务的成员不得判为已完�
   assert.equal(finished.has(MEMBER_ID), false)
 })
 
-test('rc.2 已完成成员门禁：send_message 用 agent_id 寻址已完成成员时投递 TEAM_MEMBER_FINISHED 提醒', async () => {
+test('rc.2 已完成成员门禁：send_message 用成员名寻址已完成成员时投递 TEAM_MEMBER_FINISHED 提醒', async () => {
   const events = [runEvent('on'), turnStart(1), taskEvent('t1', 'completed', 1, MEMBER_ID)]
   const host = createHost({ subagents: rc2Subagents() })
   const lead = agentOf({ id: ROOT_ID, depth: 0, events })
-  const outcome = await gateOutcome(host, execOf('send_message', lead, { agent_id: MEMBER_ID, message: '再改一轮' }))
+  const outcome = await gateOutcome(host, execOf('send_message', lead, { agent: 'worker-1', message: '再改一轮' }))
   assertSoftGate(outcome)
   assert.equal(outcome.notices.length, 1, '向已完成成员发消息必须提醒一次')
   assert.match(noticeText(outcome.notices[0]), /\[team-gate\] TEAM_MEMBER_FINISHED:/, '提醒前缀必须保持不变')

@@ -10,16 +10,28 @@
  * 带 task 走 agent.steer（空闲起一轮、运行中下一步送达），其余走 agent.inject（不唤醒）。
  * task 随 `command/run` 事件持久在 section 里，直到 `off`。不写任何自定义状态。
  * tools/pre-execute：成员侧、flat 模式成员侧与 Lead 侧一律是软门禁（放行 + 投递一次模型可见提醒，复用 agent.inject 通道）；
- * 插件在任何判据下都不返回拒绝结果。Lead 侧判据只看「本轮（事件里最后一个 turn/start 之后）有没有委派类派发」：
- * 没有派发就动取证 / 实现 / 执行工具 → 投递一条提醒并照常放行；去重按轮次刷新，Lead 收到新消息（新的 turn/start）后再动这些工具会重新提醒一次。
+ * 插件在任何判据下都不返回拒绝结果。监控面 = 「除编排动作（subagent / send_message / wait_agent / todo_write 等）以外的
+ * 全部工具」：实现 / 取证 / 执行 / mcp__* 等未枚举工具都按「Lead 亲自下场」处理，每个 turn 首次投递一条提醒并照常放行；
+ * read / grep / glob 仅在本 turn 已派发成员后视为「校验产物」而豁免。去重令牌是最后一个 turn/start 的下标，
+ * 同一个 turn 只提醒一次，新的 turn 开始后重新提醒——「派发过一次」不再构成整轮豁免。
+ * 注入文案与门禁分类都从本步真实工具面派生（systemPrompt 的 context.toolSet / tools/pre-execute 的 exec.toolSet +
+ * ctx.tools.definitions(scope, toolSet)），探测不到时降级为标准档文案并 warn 一次，绝不静态断言工具存在。
  */
 
 import { randomUUID } from 'node:crypto'
+import { readdir, readFile } from 'node:fs/promises'
+import { basename, dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import Schema from '@deepseek-ai/schemastery'
 
 export const name = 'force-subagent'
 
-export const inject = ['commands', 'systemPrompt', 'subagents']
+/**
+ * 注入 `tools` 是为了按本步 toolSet 探测真实工具面（见 apply 里的 capabilitiesFor）：
+ * 探测不到时走标准档安全默认，不抛异常。宿主服务名为 `tools`
+ * （packages/boot/plugin-manager/src/tools.ts:81、packages/core/agent-tool-presentation/src/index.ts:19）。
+ */
+export const inject = ['commands', 'systemPrompt', 'subagents', 'tools']
 
 /** 默认路由（可被 Config 覆盖）：子代理默认继承 parent 路由（manager.resolveChildAgentOptions），未配置时本地 in-process 子代理落到 DEFAULT_ROUTE。 */
 /** 默认路由：未配置时与历史硬编码一致，行为不变。 */
@@ -34,9 +46,20 @@ const routeSchema = () => Schema.object({
   model: Schema.string().default(DEFAULT_ROUTE.model),
 })
 
+/**
+ * 可选路由（审查代码模型）：与 routeSchema 的区别是「两段都留空 = 未配置」。
+ * 默认值是空串而不是 DEFAULT_ROUTE，是为了让「没配 reviewer」在服务端保持 undefined，
+ * 从而回退到 member / subagent 路由；默认值填 DEFAULT_ROUTE 会让每次激活都强制覆盖。
+ */
+const optionalRouteSchema = () => Schema.object({
+  provider: Schema.string().default(''),
+  model: Schema.string().default(''),
+})
+
 const workspaceSchema = () => Schema.object({
   member: routeSchema().default({ ...DEFAULT_ROUTE }),
   subagent: routeSchema().default({ ...DEFAULT_ROUTE }),
+  reviewer: optionalRouteSchema().default({ provider: '', model: '' }),
 })
 
 /**
@@ -58,6 +81,7 @@ export const Config = Schema.object({
   enabled: Schema.boolean().default(true),
   member: routeSchema().default({ ...DEFAULT_ROUTE }),
   subagent: routeSchema().default({ ...DEFAULT_ROUTE }),
+  reviewer: optionalRouteSchema().default({ provider: '', model: '' }),
   mode: Schema.string().default('nested'),
   workspaces: Schema.dict(workspaceSchema()).default({}),
 }).volatile()
@@ -81,7 +105,39 @@ function normalizeMode(value, fallback, warn) {
   return 'nested'
 }
 
-/** 配置深合并：缺省/非法值回退默认，workspaces 逐项规范化，永不抛。warn 可选，只用于 mode 非法取值（warn-once）。 */
+/**
+ * 半残可选路由只告警一次：同一处配置在每次实时解析里都会重新归一化，逐次 warn 会刷屏。
+ * 去重键是「配置位置」，所以全局 reviewer 与某个 workspaces 条目的 reviewer 各算一次。
+ * warn-once 的确切语义：模块级 Set、每进程只提醒一次 —— 同一个配置位置在本进程内第一次半残才告警，
+ * 之后无论重新解析多少次（含配置改好后再次半残）都不再重复告警；它不是「每次加载 / 每次解析都提醒」。
+ * 跨进程（重启或热重载后重新 apply 插件、模块重新求值）才会重新计数。
+ */
+const warnedReviewerConfig = new Set()
+
+/**
+ * 可选路由归一化：provider 与 model 都是非空字符串才算「配置了」。
+ * - 两段都空 / 缺失 / 非法 → undefined：不挂字段，配置结果仍与 DEFAULT_CONFIG 深相等，
+ *   审查代码的激活因此回退 member / subagent 路由（面板「留空则回退」的口径）。
+ * - 只配了一半（只有 provider 或只有 model）→ 忽略整条路由并 warn-once：
+ *   半残配置注入出去就是「provider 配了、模型却是继承值」这种最难排查的错位，绝不注入残缺路由。
+ */
+function optionalRoute(value, location, warn) {
+  const candidate = unwrapVolatile(value)
+  const fields = candidate !== null && typeof candidate === 'object' ? candidate : {}
+  const provider = typeof fields.provider === 'string' && fields.provider.length > 0 ? fields.provider : ''
+  const model = typeof fields.model === 'string' && fields.model.length > 0 ? fields.model : ''
+  if (provider.length === 0 && model.length === 0) return undefined
+  if (provider.length === 0 || model.length === 0) {
+    if (!warnedReviewerConfig.has(location)) {
+      warnedReviewerConfig.add(location)
+      warn?.(`可选路由 ${location} 只配置了一半（provider=${provider === '' ? '空' : JSON.stringify(provider)}、model=${model === '' ? '空' : JSON.stringify(model)}），整条已忽略，审查代码的激活回退 member / subagent 路由。`)
+    }
+    return undefined
+  }
+  return { provider, model }
+}
+
+/** 配置深合并：缺省/非法值回退默认，workspaces 逐项规范化，永不抛。warn 可选，用于 mode 非法取值与半残 reviewer 路由（均 warn-once）。 */
 export function resolveConfig(config, warn) {
   const source = unwrapVolatile(config)
   const root = source !== null && typeof source === 'object' ? source : {}
@@ -101,19 +157,27 @@ export function resolveConfig(config, warn) {
       if (typeof key !== 'string' || key.length === 0) continue
       const item = unwrapVolatile(entry)
       if (item === null || typeof item !== 'object' || Array.isArray(item)) continue
-      workspaces[key] = {
+      const normalized = {
         member: route(item.member, DEFAULT_CONFIG.member),
         subagent: route(item.subagent, DEFAULT_CONFIG.subagent),
       }
+      // 工作区 reviewer 同样是可选的：未配就不挂字段，让 resolveRoute 回退全局 reviewer 或 member / subagent。
+      const scopedReviewer = optionalRoute(item.reviewer, `workspaces[${JSON.stringify(key)}].reviewer`, warn)
+      if (scopedReviewer !== undefined) normalized.reviewer = scopedReviewer
+      workspaces[key] = normalized
     }
   }
-  return {
+  const resolved = {
     enabled: typeof root.enabled === 'boolean' ? root.enabled : DEFAULT_CONFIG.enabled,
     mode,
     member: route(root.member, DEFAULT_CONFIG.member),
     subagent: route(root.subagent, DEFAULT_CONFIG.subagent),
     workspaces,
   }
+  // reviewer 未配置时不挂字段：DEFAULT_CONFIG 里没有这个键，resolveConfig({}) 必须仍与它深相等。
+  const reviewer = optionalRoute(root.reviewer, 'reviewer', warn)
+  if (reviewer !== undefined) resolved.reviewer = reviewer
+  return resolved
 }
 
 /** 沿 parentSession 上溯的最大层数（防环由 seen 集合额外保证）。 */
@@ -200,12 +264,65 @@ export function workspaceKeyFor(ctx, session) {
   return cwd
 }
 
-/** 路由解析：工作区覆盖优先，否则回退全局同类路由。 */
+/**
+ * 路由解析：工作区覆盖优先，否则回退全局同类路由。
+ * member / subagent 一定存在（resolveConfig 逐项补默认），所以这两类永远返回一个完整路由。
+ * reviewer 是可选路由：工作区条目没有 → 全局 reviewer；全局也没有 → undefined，
+ * 由调用方回退 baseKind（member / subagent）路由。判定口径对三类完全一致，不分叉。
+ */
 export function resolveRoute(settings, key, kind) {
   if (settings === undefined || settings === null) return undefined
   const scoped = key !== undefined && settings.workspaces !== undefined ? settings.workspaces[key] : undefined
   if (scoped !== undefined && scoped !== null && scoped[kind] !== undefined) return scoped[kind]
   return settings[kind]
+}
+
+/**
+ * 审查代码激活的识别（reviewer 路由的判据）。三段判定，从严到宽，绝不因文案里出现「审查」二字就误判：
+ * 1) 显式给了 name：只认名字本身（reviewer / reviewer-1 / code-reviewer / adversarial-reviewer /
+ *    review / code-review / code-review-1）。给了非 reviewer 的名字就是明确的命名意图，
+ *    即使 label 写着「实现审查代码模型」也不改判 —— 名字优先，且 name 不可命中时绝不回落到 label。
+ * 2) 没有 name 时看 request.agentPreset（宿主 preset id 与成员名同一套语法）。
+ * 3) 都没有（未命名 subagent / workflow）才看 label，且只认「这条 label 本身就是一条审查指令」的写法：
+ *    判定必须锚定在 label 开头（只容忍前置空白与 please 礼貌前缀），审查词组之后紧跟结尾或分隔符。
+ *    禁止在 label 的任意位置做子串匹配：「修复 code review 面板的崩溃」「实现 code review 能力」
+ *    「给 code-review 加个按钮」「修复 code review 的 bug」里的 code review 是待处理的对象，
+ *    不是这条任务自身的意图。误判代价不对称 —— 假阳性会把实现类任务送进「审查代码模型」（有害），
+ *    假阴性只是回退到该激活原本的 member / subagent 路由（安全）。
+ *    所以本判据严格优先，宁可漏判，绝不因文案里某处出现 code review 就认定审查任务。
+ */
+const REVIEWER_NAME_RE = /^(?:[a-z0-9-]+-)?reviewer(?:-\d+)?$|^(?:code-)?review(?:-\d+)?$/
+// label 判据锚定在开头：^\s*(?:please\s+)? 只容忍前置空白与礼貌前缀，不是放宽子串匹配。
+// 旧版另有一条非锚定的 REVIEWER_LABEL_PHRASE_RE（/\bcode[\s_-]+review(?:er)?\b/，任意位置子串匹配），
+// 它把实现类 label 误判成审查任务，已删除；锚定的 code…review 词组由本条覆盖。
+// 裸 review / reviewing 不得带任意宾语：宾语是可选的时「review 需求文档」「review the docs」
+// 「review 配置迁移」也会命中，与本判据「宁可漏判」的口径不符。故要么整条 label 到此结束，
+// 要么紧跟冒号或左括号且其后只有「数字」轮次编号并到此结束（词族 round|pass|iter|iteration|轮|第|批|次
+// + 可选空白 + 可选 # + 必需数字，或裸 #?数字：review: round 2 / review (2) 命中；
+// review: round two / review: 3rd / review: 第 2 轮 / review: 批次 7 / review: round 2 附加说明 不命中），要么后接明确的代码审查宾语
+// （可带冠词 the/this/that/a/an + code|diff|pr|changes|impl…|patch|commit|pull request）。
+const REVIEWER_LABEL_RE = /^\s*(?:please\s+)?(?:code[\s_-]*review(?:er)?|review(?:ing)?\s+(?:the\s+|this\s+|that\s+|a\s+|an\s+)?(?:code|diff|pr|changes|impl\w*|patch|commit|pull request)|review(?:ing)?(?:[ \t]*$|[ \t]*[:：(（][ \t]*(?:(?:round|pass|iter|iteration|轮|第|批|次)[ \t]*#?\d+|#?\d+)[)）]?[ \t]*$)|代码审查|审查代码|对抗审查|代码评审|评审代码)(?:$|[\s:：\-—(（])/i
+
+const normalizedName = (value) => (typeof value === 'string' ? value.trim().toLowerCase() : '')
+
+/**
+ * @param spec - 宿主 SubagentActivationSpec（rc.2 扁平形状：name? / label / provider 同在顶层）。
+ * @param request - 与 spec 同源或它的 request 包装；只用其中的 agentPreset 作为身份线索。
+ * @returns 是否应按 reviewer 路由注入模型。
+ */
+export function isReviewerActivation(spec, request) {
+  const name = normalizedName(spec?.name)
+  if (name !== '') return REVIEWER_NAME_RE.test(name)
+
+  const preset = normalizedName(request?.agentPreset)
+  if (preset !== '' && REVIEWER_NAME_RE.test(preset)) return true
+
+  const label = typeof spec?.label === 'string' ? spec.label.trim() : ''
+  if (label === '') return false
+  // 未命名激活把 reviewer 直接写在 label 里（宿主允许 label 就是成员名）时同样算审查任务；
+  // 仍然只认整条 label 就是一个 reviewer 名字，不做子串匹配。
+  // 两条判据都必须锚定：任何一条都不许退化成「label 里某处出现 code review」。
+  return REVIEWER_LABEL_RE.test(label) || REVIEWER_NAME_RE.test(label.toLowerCase())
 }
 
 /** 宿主 Session 的 id：Session.id 与 SessionHeader.id 同源（core/session/src/types.ts:95 起）。 */
@@ -335,6 +452,27 @@ export function finishedMembers(events, rootId) {
 }
 
 /**
+ * 成员名 → 成员 id 的统一解析：已完成成员门禁的两个寻址口（send_message 的 agent、team_task_update 的 owner）共用。
+ * 先看看板事件登记过的名字表（rc.1 的 team/member，roster.ts:42-53）；rc.2 不再写 team/member，
+ * 名字是模型侧的，宿主自己经 subagents.resolveName 解析成 Session id（roster.ts），门禁按同一口径解析一次。
+ * 两条路都拿不到就返回 undefined：按「判不了就不提醒」的既有 fail-open 口径放行，不 warn。
+ */
+async function memberByName(name, idsByName, ctx, agent, signal) {
+  if (typeof name !== 'string' || name.length === 0) return undefined
+  const registered = idsByName.get(name)
+  if (registered !== undefined) return registered
+  const subagents = ctx.get('subagents')
+  if (typeof subagents?.resolveName !== 'function') return undefined
+  try {
+    return String(await subagents.resolveName(agent, name, signal))
+  } catch (error) {
+    // 名字解析不了（树里没有这个名字）就不是判定对象：按「判不了就不提醒」的既有口径放行，不 warn。
+    void error
+    return undefined
+  }
+}
+
+/**
  * 会话在 Agent-Team 里的身份。
  * rc.1：宿主 `agentTeams.tryMembership` 还在时直接沿用，'lead' / 'teammate' / undefined 三种语义原样不变。
  * rc.2：该 API 已删除（docs/upgrade-guide/v0.2.1-rc.2/agent-team-subagents），改由委派树推导：
@@ -411,28 +549,219 @@ const SECTION_NAME = 'force-subagent:agent-team'
 // director 的 orchestrate section 用 55；57 相邻但不与宿主 SECTION_ORDERS 撞值。
 const SECTION_ORDER = 57
 
-const LEAD_NUDGE = '本会话已启用 Agent-Team 强制委派提示（/using-agent-team off 可关闭）。Lead：不要独自实现；先用 team_task_create 把工作拆成互不依赖的小任务（blocked_by 只写真实依赖、write_scopes 互斥），再在单轮内并行 subagent 拉起全部初始成员（需要继承本会话上下文用 subagent_fork），记下每个成员返回的 agent id，不要串行建一个等一个；然后先推进可做的工作，仅在确实被阻塞时才 wait_agent 一次（同一 turn 不得连续两次），收到结果立即处理；你只做架构、拆解、调度、仲裁与最终验收，细节实现全部派发。【Lead 委派提醒，每轮首次动这些工具会收到一次】你自己动取证工具 bash / pwsh / read / read_image / grep / glob / web_fetch / web_search，自己动实现工具 write / edit / apply_patch / str_replace_editor，或自己动执行工具 run_code / terminal_open / terminal_read / terminal_send / terminal_signal（run_code 能在程序里读文件、写文件、跑命令；terminal_* 是跨 turn 存活的持久 shell），本轮还没有 subagent / subagent_fork 派发时，每轮首次动这些工具会收到一条前缀 [team-gate] 的提醒，工具照常执行；收到新消息开新一轮后，同一判据会再提醒一次。正确做法是先 team_task_create 拆分任务，再在单轮内并行 subagent 派成员承接；本轮已经派发过就不再重复提醒。'
+// ── 工具面能力探测与分档文案（R1/R2）──────────────────────────────────────────────────────────
+// 旧实现的根因：nudge 静态写死 team_task_create / 旧 spawn 工具名 / interrupt_agent 等名字，rc.2 里其中
+// 若干不存在或默认关闭 → 模型拿到无法执行的指令，只好自己干。现在所有文案都由「本会话真实工具面」派生。
 
-/** flat 模式追加在 Lead nudge 之后的一节：成员收敛动作 + 宿主无删除成员 API 的事实，防止模型假装删除成员。 */
-const FLAT_LEAD_APPENDIX = '\n\n【flat 模式：只用成员，不派子代理】成员就是你在委派树里直接派出的 subagent，自己执行，成员的 subagent / subagent_fork / subagent_role / close_subagent / workflow 会被门禁放行但立即提醒（提醒前缀 [team-gate]）。你每收到一条成员消息，必须先判定该成员本次任务是否完成：已完成 → 立即 interrupt_agent(agent_id=该成员) 中断该成员，并用 team_task_update 关闭对应任务，此后永不再向该成员 send_message、不得复用该成员；未完成 → 继续给该成员派活。这条不靠提示词自觉也不靠硬拦：向已完成成员 send_message、或把任务 team_task_update 的 claim / reassign 落到已完成成员头上，工具调用仍会成功，但门禁会立即投递一条前缀 [team-gate] TEAM_MEMBER_FINISHED: 的提醒——看到它就该收手。需要新活就再 subagent 派一个新成员承接（send_message / interrupt_agent 都用 list_agents 给出的 agent_id，不再用别名）。构建团队时把工作拆成互不依赖的小任务（write_scopes 互斥、blocked_by 只写真实依赖），在单轮内并行 subagent 多个成员一次拉齐，不要串行建一个等一个。注意：宿主没有删除成员的 API（没有删除工具），软踢出只能做到「interrupt_agent 中断其当前 turn + 不再 send_message 唤醒」，委派记录仍然存在——不要声称或假装删除成员。【flat 模式 Lead 提醒同样生效】flat 不放宽 Lead 门禁：Lead 自己的实现工具 write / edit / apply_patch / str_replace_editor、取证工具 bash / pwsh / read / read_image / grep / glob / web_fetch / web_search 与执行工具 run_code / terminal_open / terminal_read / terminal_send / terminal_signal，本轮还没有 subagent 派发时，每轮首次动这些工具会收到一条前缀 [team-gate] 的提醒，工具照常执行，新的 turn 开始后会再提醒一次。实现与取证都必须委派：出路是先 team_task_create 拆分，再在单轮内并行 subagent 让成员承接；成员自己执行这些工具不受该提醒约束。'
+/**
+ * 探测用的工具名标记：只在这里写死 rc.2 的真实注册名，其它地方一律先探测再引用。
+ * - subagent / subagent_fork：tool-subagent 按加载期 toolName 注册（默认 `subagent`，
+ *   packages/subagent/tool-subagent/src/index.ts:49-52），Web/Desktop 预设同时提供 `subagent_fork`
+ *   （docs/tool-catalog.md:45）；
+ * - send_message / list_agents / wait_agent / interrupt_agent：
+ *   packages/subagent/tool-subagent-control/src/{index,list-agents,wait-agent}.ts，
+ *   interrupt_agent 受配置层 `interrupt: false` 控制（内置配置已关闭，docs/tool-catalog.md:46）；
+ * - todo_write：packages/todo/tool-todo/src/index.ts:137；workflow：docs/tool-catalog.md:2705；
+ * - team_task_*：packages/team/tool-agent-team/src/index.ts:118-234，每个工具都带 `{ when: enabled(agent) }`，
+ *   **必须带本步 toolSet 探测**（packages/core/tools/src/index.ts:239-241：省略 toolSet 只读注册期可见集合），
+ *   否则 Team 开关 OFF 时会把 team_task_* 判成存在——这是本任务最容易踩的假阳性。
+ */
+const TOOL_MARKERS = Object.freeze({
+  board: 'team_task_create',
+  boardList: 'team_task_list',
+  interrupt: 'interrupt_agent',
+  subagent: 'subagent',
+  fork: 'subagent_fork',
+  send: 'send_message',
+  list: 'list_agents',
+  wait: 'wait_agent',
+  todo: 'todo_write',
+  workflow: 'workflow',
+})
 
-// 成员会话没有自己的 command/run 记录，门控改由 Lead 会话的开关派生（见 text 回调与 tools/pre-execute 监听）。
-const MEMBER_NUDGE = '你是 Agent-Team 成员（rc.2：你就是 Lead 直接派出的一个 subagent，靠 agent_id 被寻址）。本会话的 Lead 已启用强制委派提示（/using-agent-team off 可关闭）：除编排类与只读工具（subagent / subagent_fork / subagent_role / close_subagent / workflow / team_task_* / send_message / wait_agent / list_agents / interrupt_agent / job_* / skill / todo_write / read / grep / glob）外，其余工具会被门禁放行但立即提醒，仍必须委派；你只是编排者，加载必需技能后，本轮第一个业务工具调用必须是委派（subagent / subagent_fork / workflow），拆分子任务（写范围互斥）后单轮批量派发并在 team_task_* 看板登记；宿主对委派深度有硬上限（subagent 服务的 maxDepth），派不出就是它太小，回报 Lead 调整而不是自己硬撑；只有 read、grep、glob 可自己用来校验产物，自己只做拆分、合并与校验；阻塞时 wait_agent 只等一次，同一 turn 不得连续两次，收到结果立即处理。'
+/**
+ * 探测失败时的安全默认（standard 档）：只承诺 rc.2 稳定存在的委派名词。
+ * 刻意不承诺 team_task_*（需要 Team 开关）、rc.1 的旧 spawn 工具（rc.2 已删除）——这两类正是旧文案把模型逼去自己干活的根因。
+ * 能力字段是三态：true = 探测到确实存在，false = 探测到确实不存在，undefined = 未确认。
+ * 未确认只能写中性表述，绝不做「本会话没有这个工具」的否定断言，也不点名它。
+ * interrupt 留 undefined：interrupt_agent 默认注册、但可被配置关掉
+ * （packages/subagent/tool-subagent-control/src/index.ts:30 的 `interrupt` 默认 true、:118-120 关成 false 时不注册），
+ * 探测失败时无从确知，所以既不承诺、也不否定。
+ */
+const STANDARD_CAPABILITIES = Object.freeze({
+  probed: false,
+  board: false,
+  interrupt: undefined,
+  subagent: true,
+  fork: true,
+  send: true,
+  list: true,
+  wait: true,
+  todo: true,
+  workflow: true,
+})
 
-/** flat 模式的成员提示词：整段替换 MEMBER_NUDGE。追加式写法会在同一段提示里既要求委派又宣布作废，模型两头都能挑；替换式没有这个矛盾，也更短。 */
-const MEMBER_NUDGE_FLAT = '你是 Agent-Team 成员（flat 模式：本团队只用成员、不派子代理；你就是 Lead 直接派出的一个 subagent，靠 agent_id 被寻址）。本会话的 Lead 已启用强制委派提示（/using-agent-team off 可关闭）：subagent / subagent_fork / subagent_role / close_subagent / workflow 会被门禁放行但立即提醒，你自己执行分给你的任务——read / grep / glob 取证、write / edit 改代码、bash 跑命令与跑测试都由你完成；用 team_task_* 看板登记进度，完成后用 send_message 把结果交回 Lead（agent_id 用 list_agents 给出的 Lead 会话 id），由 Lead 判定完成并 interrupt_agent 收敛你；宿主没有删除成员的 API，不要声称或假装删除成员。你所在团队的构建方式：Lead 把工作拆成互不依赖的小任务（write_scopes 互斥）并在单轮内并行 subagent 多个成员，不要串行建一个等一个——所以你只管自己这一小块，做完立即交回，不要等其它成员。'
+/** 工具名集合 → 能力快照（只记录文案与门禁真正会用到的能力）。 */
+const capabilitiesFromNames = (names) => ({
+  probed: true,
+  board: names.has(TOOL_MARKERS.board),
+  interrupt: names.has(TOOL_MARKERS.interrupt),
+  subagent: names.has(TOOL_MARKERS.subagent),
+  fork: names.has(TOOL_MARKERS.fork),
+  send: names.has(TOOL_MARKERS.send),
+  list: names.has(TOOL_MARKERS.list),
+  wait: names.has(TOOL_MARKERS.wait),
+  todo: names.has(TOOL_MARKERS.todo),
+  workflow: names.has(TOOL_MARKERS.workflow),
+})
+
+/**
+ * 文案档位（R2）：
+ * - team：team_task_create 真实可见 → 保留看板式流程；
+ * - standard：没有看板但有 subagent / subagent_fork → todo_write 任务板 + 派成员；
+ * - none：连 subagent 都探测不到 → 直说「没有委派能力，直接执行」，不静默，也不教不存在的工具。
+ */
+const delegationTier = (caps) => (caps.board ? 'team' : caps.subagent || caps.fork ? 'standard' : 'none')
+
+/** 「拆解 + 登记」的写法：只写当前档位真实存在的工具名。 */
+const planningHint = (caps) => (delegationTier(caps) === 'team'
+  ? '先用 team_task_create 把工作拆成互不依赖的小任务（blocked_by 只写真实依赖、write_scopes 互斥）并登记看板'
+  : caps.todo
+    ? '先把工作拆成互不依赖的小任务（写范围互斥、依赖只写真实依赖），用 todo_write 登记任务板'
+    : '先把工作拆成互不依赖的小任务（写范围互斥、依赖只写真实依赖），并把各自的写范围写进派发说明')
+
+/** 能力三态 → 工具名：只有确认存在（true）才点名；未确认（undefined）与确认没有（false）都不点名。 */
+const knownTool = (caps, key) => (caps[key] === true ? TOOL_MARKERS[key] : '')
+
+/** 本会话真实存在的委派动词串（传入的 key 里真实存在的那些），一个都没有就是空串。 */
+const dispatchTools = (caps, ...keys) => keys.map((key) => knownTool(caps, key)).filter((tool) => tool !== '').join(' / ')
+
+/** 「再派一个新成员」的写法：动词只取真实存在的派发动词，都没有就不点名。 */
+const relaunchPhrase = (caps) => { const verb = dispatchTools(caps, 'subagent', 'fork').split(' / ')[0]; return verb === '' ? '再派一个新成员' : `再 ${verb} 派一个新成员` }
+
+/** 批量拉齐成员的写法：同上，只点名真实存在的派发动词。 */
+const launchPhrase = (caps) => { const verb = dispatchTools(caps, 'subagent', 'fork').split(' / ')[0]; return verb === '' ? '一次并行拉起全部成员' : `并行 ${verb} 一次拉起全部成员` }
+
+/** 「不再唤醒已完成成员」的写法：探测到 send_message 才点名它，否则只说纪律。 */
+const wakePhrase = (caps) => (caps.send === true ? `向它 ${TOOL_MARKERS.send} 唤醒` : '唤醒它')
+
+/** 等待纪律的写法：探测到 wait_agent 才点名它；确认没有就说没有；未确认只讲纪律、不点名、不否定。 */
+const waitAdvice = (caps) => (caps.wait === true
+  ? `仅在确实被阻塞时才 ${TOOL_MARKERS.wait} 一次（同一 turn 不得连续两次）`
+  : caps.wait === false ? '本会话没有等待成员结果的工具：阻塞时先推进可做的工作'
+    : '阻塞时最多等一次，同一 turn 不得连续两次')
+
+/** 「派发」的写法：只写本档真实存在的委派工具名；fork 只在探测到 subagent_fork 时才出现。 */
+const dispatchHint = (caps) => {
+  const launch = knownTool(caps, 'subagent') || knownTool(caps, 'fork')
+  const inherit = caps.subagent === true && caps.fork === true ? `（需要继承本会话上下文用 ${TOOL_MARKERS.fork}）` : ''
+  const track = caps.list === true ? `用 ${TOOL_MARKERS.list} 记下成员名` : '记下每个成员的名字'
+  return `再在单轮内并行 ${launch} 拉起全部初始成员${inherit}，${track}，不要串行建一个等一个`
+}
+
+/**
+ * Lead 提醒里的门禁规则：明确「派发过也不整轮豁免」，并给出只含真实工具名的出路。
+ * 不枚举取证 / 实现工具名——被点名的工具由提醒正文按当次真实调用给出。
+ */
+const leadGateSentence = (caps) => `【Lead 委派提醒，每轮都会生效】你自己动取证 / 实现 / 执行类工具（含 mcp__* 等插件工具）时，无论本轮是否已经派发成员，每个 turn 首次都会收到一条前缀 [team-gate] 的提醒，工具照常执行；只有 read / grep / glob 在本轮已派发后视为校验、不再提醒。正确做法：${planningHint(caps)}，${dispatchHint(caps)}。收到新消息开新一轮后同一判据会再提醒一次。`
+
+/** Lead nudge；关闭强制委派时由 promptText 返回空串。 */
+const leadNudge = (caps) => {
+  if (delegationTier(caps) === 'none') {
+    return '本会话已启用 Agent-Team 强制委派提示（/using-agent-team off 可关闭），但本会话没有探测到委派工具（subagent / subagent_fork 都不可用）：没有委派能力，直接执行任务即可，不要声称已派发成员，也不要调用不存在的委派工具。若宿主本应提供委派能力，检查 subagent 服务是否加载与派发深度上限（maxDepth）；门禁只做提醒、不阻断任何工具调用。'
+  }
+  const parts = ['本会话已启用 Agent-Team 强制委派提示（/using-agent-team off 可关闭）。Lead：不要独自实现；']
+  parts.push(`${planningHint(caps)}，`)
+  parts.push(`${dispatchHint(caps)}；`)
+  parts.push('审查代码的成员 / 子代理建议命名为 reviewer（如 name: "reviewer"）。')
+  parts.push(`然后先推进可做的工作，${waitAdvice(caps)}，收到结果立即处理；你只做架构、拆解、调度、仲裁与最终验收，细节实现全部派发。`)
+  if (caps.send === true) parts.push(`派活与追问统一用 ${TOOL_MARKERS.send}({ agent: 成员名, message: 内容 })。`)
+  parts.push(caps.list === true
+    ? `${TOOL_MARKERS.list} 不带参数（rc.2 签名）。`
+    : caps.list === false
+      ? '本会话没有列出成员的工具，按派发时宿主返回的成员名寻址成员。'
+      : '本会话是否提供列出成员的工具未确认，按派发时宿主返回的成员名寻址成员。')
+  parts.push(caps.interrupt === true
+    ? `成员完成后可用 ${TOOL_MARKERS.interrupt} 收敛；宿主不提供删除成员的入口，不要声称删除成员。`
+    : caps.interrupt === false
+      ? `成员交回结果后不再${wakePhrase(caps)}、不复活已完成成员；${relaunchPhrase(caps)}承接新活。本会话没有中断成员的工具，不要声称中断或删除成员。`
+      : `成员交回结果后不再${wakePhrase(caps)}、不复活已完成成员；${relaunchPhrase(caps)}承接新活。本会话是否提供中断成员的工具未确认，不要声称中断或删除成员。`)
+  parts.push(leadGateSentence(caps))
+  return parts.join('')
+}
+
+/** flat 模式追加在 Lead nudge 之后的一节：成员收敛动作 + 宿主无删除成员 API 的事实。 */
+const flatLeadAppendix = (caps) => {
+  if (delegationTier(caps) === 'none') return ''
+  const verbs = dispatchTools(caps, 'subagent', 'fork', 'workflow')
+  const addressHint = caps.list === true ? `${TOOL_MARKERS.list} 不带参数；` : ''
+  const parts = ['\n\n【flat 模式：只用成员，不派子代理】成员就是你在委派树里直接派出的成员，每个成员自己执行分到的任务；成员再调 ' + verbs + ' 会被门禁放行但立即提醒。']
+  if (caps.send === true) parts.push(`${addressHint}用 ${TOOL_MARKERS.send}({ agent: 成员名, message: 内容 }) 给成员派活，同一个成员名持续可寻址。`)
+  parts.push(`你每收到一条成员消息，先判定该成员本次任务是否完成：已完成 → 不再${wakePhrase(caps)}、不复用该成员，需要新活就${relaunchPhrase(caps)}；未完成 → 继续给它派活。`)
+  parts.push(caps.interrupt === true
+    ? '已完成成员可用 interrupt_agent 中断其当前 turn。'
+    : caps.interrupt === false
+      ? '本会话没有中断成员的工具：成员完成后你只能不再唤醒它，不要声称中断或删除成员。'
+      : '本会话是否提供中断成员的工具未确认：成员完成后你只能不再唤醒它，不要声称中断或删除成员。')
+  parts.push('宿主没有删除成员的 API（没有删除工具），委派记录仍然存在——不要声称或假装删除成员。')
+  parts.push(`构建团队时把工作拆成互不依赖的小任务（写范围互斥、依赖只写真实依赖），在单轮内${launchPhrase(caps)}，不要串行建一个等一个。`)
+  parts.push('flat 不放宽 Lead 门禁：门禁规则与 nudge 正文相同，成员自己执行工具不受该提醒约束。')
+  return parts.join('')
+}
+
+/** 成员 nudge：flat 整段替换（成员自己执行），nested 让成员继续派子代理；两档都只提真实工具。 */
+const memberNudge = (caps, mode) => {
+  const dispatchedBy = knownTool(caps, 'subagent') || knownTool(caps, 'fork')
+  const head = caps.probed
+    ? `你是 Agent-Team 成员（rc.2：你就是 Lead 直接派出的一个成员${dispatchedBy === '' ? '' : `（由 ${dispatchedBy} 派出）`}，${caps.list === true ? `靠 ${TOOL_MARKERS.list} 给出的 agent 名` : '靠 Lead 派发时记下的成员名'}被寻址）。`
+    : '你是 Agent-Team 成员（本会话委派工具面未能探测，按 rc.2 标准工具面说明）。'
+  if (delegationTier(caps) === 'none') {
+    return `${head}本会话没有探测到委派工具（subagent / subagent_fork 都不可用）：直接执行分给你的任务即可（read / grep / glob 取证、write / edit 改代码、bash 跑命令与跑测试都由你完成），完成后${caps.send === true ? `用 ${TOOL_MARKERS.send} ` : ''}把结果交回 Lead。`
+  }
+  const board = caps.board ? 'team_task_*' : caps.todo ? 'todo_write' : ''
+  if (mode === 'flat') {
+    const verbs = dispatchTools(caps, 'subagent', 'fork', 'workflow')
+    const parts = [`${head}flat 模式：本团队只用成员、不派子代理；${verbs} 会被门禁放行但立即提醒，你自己执行分给你的任务——read / grep / glob 取证、write / edit 改代码、bash 跑命令与跑测试都由你完成。`]
+    if (board) parts.push(`用 ${board} 登记进度；`)
+    parts.push(caps.send === true ? `完成后用 ${TOOL_MARKERS.send}({ agent: 成员名, message: 结果 }) 把结果交回 Lead，由 Lead 判定完成。` : '完成后把结果交回 Lead，由 Lead 判定完成。')
+    parts.push(caps.interrupt === true ? `Lead 可能用 ${TOOL_MARKERS.interrupt} 收敛你。` : '宿主没有删除成员的 API，不要声称或假装删除成员。')
+    parts.push(`你所在团队的构建方式：Lead 把工作拆成互不依赖的小任务并在单轮内${launchPhrase(caps)}，所以你只管自己这一小块，做完立即交回，不要等其它成员。`)
+    return parts.join('')
+  }
+  const orchestration = [dispatchTools(caps, 'subagent', 'fork', 'workflow'), board, knownTool(caps, 'send'), knownTool(caps, 'wait'), knownTool(caps, 'list'), knownTool(caps, 'interrupt')]
+    .filter((entry) => entry !== '').join(' / ')
+  const parts = [`${head}本会话的 Lead 已启用强制委派提示（/using-agent-team off 可关闭）：除编排类与只读工具（${orchestration} / job_* / skill / read / grep / glob）外，其余工具会被门禁放行但立即提醒，仍必须委派；你只是编排者，加载必需技能后，本轮第一个业务工具调用必须是委派，拆分子任务（写范围互斥）后单轮批量派发`]
+  parts.push(board ? `并在 ${board} 登记；` : '；')
+  parts.push(`宿主对委派深度有硬上限（subagent 服务的 maxDepth），派不出就是它太小，回报 Lead 调整而不是自己硬撑；只有 read、grep、glob 可自己用来校验产物，自己只做拆分、合并与校验；${waitAdvice(caps)}，收到结果立即处理。`)
+  return parts.join('')
+}
 
 /** 开启且带 task 时，section 在 nudge 之后追加持续有效的任务段。 */
 const TASK_PREFIX = '\n\n本会话任务（/using-agent-team 下达，持续有效）：'
 
-const ENABLED_REMINDER = '【强制委派提醒】用户通过 /using-agent-team 开启本会话的 Agent-Team 强制委派（持续到 /using-agent-team off）。你是 Lead：只做架构、拆解、调度、仲裁与最终验收；实现与测试必须委派。'
-const ENABLED_TASK_REMINDER = (task) => `【强制委派提醒】用户通过 /using-agent-team 开启本会话的 Agent-Team 强制委派，并下达任务（本会话持续有效，/using-agent-team off 关闭）：\n${task}\n你是 Lead：只做架构、拆解、调度、仲裁与最终验收；实现与测试必须用 team_task_* 登记后批量 subagent 委派。`
+/**
+ * 命令 notice 也按档分文案：none 档的 section 已经说「没有委派能力、直接执行」，
+ * notice 再命令「实现与测试必须委派」就是同一轮里两条互相打架的指令。
+ * 档位只取自探测成功的快照（caps.probed === true）：
+ * - 一条都没探过（命令是本会话第一个动作，section 与门禁都还没跑）或探测失败只拿到安全默认 → 中性句：
+ *   既不承诺「能委派 / 必须委派」，也不断言「没有委派工具」，把能力判断让给同轮随后装配的 section，
+ *   同轮两条指令因此不可能互相矛盾；
+ * - 探测成功才按 none / 非 none 分档：none 才否定，非 none 才要求委派。
+ */
+const leadClause = (caps) => (caps === undefined || caps.probed !== true
+  ? '本会话已开启 Agent-Team 强制委派提示；本会话的真实工具面尚未确认，是否具备委派能力以本轮系统提示的 Agent-Team 段为准。'
+  : delegationTier(caps) === 'none'
+    ? '但本会话未检测到委派工具，强制委派提示不生效：没有委派能力，直接执行任务即可，不要声称已派发成员（本会话真实工具面见系统提示的 Agent-Team 段）。'
+    : '你是 Lead：只做架构、拆解、调度、仲裁与最终验收；实现与测试必须委派（本会话真实可用的委派工具见系统提示的 Agent-Team 段）。')
+
+const ENABLED_REMINDER = (caps) => `【强制委派提醒】用户通过 /using-agent-team 开启本会话的 Agent-Team 强制委派（持续到 /using-agent-team off）。${leadClause(caps)}`
+const ENABLED_TASK_REMINDER = (task, caps) => `【强制委派提醒】用户通过 /using-agent-team 开启本会话的 Agent-Team 强制委派，并下达任务（本会话持续有效，/using-agent-team off 关闭）：\n${task}\n${leadClause(caps)}`
 const DISABLED_REMINDER = '【强制委派提醒已关闭】用户执行 /using-agent-team off：本会话不再强制委派，按普通方式处理。'
 
-const reminderText = (state) =>
+const reminderText = (state, caps) =>
   !state.enabled ? DISABLED_REMINDER
-    : state.task === undefined ? ENABLED_REMINDER
-      : ENABLED_TASK_REMINDER(state.task)
+    : state.task === undefined ? ENABLED_REMINDER(caps)
+      : ENABLED_TASK_REMINDER(state.task, caps)
 
 const summaryText = (state) =>
   !state.enabled ? '已关闭强制委派'
@@ -444,12 +773,12 @@ const resultText = (state) =>
     : state.task === undefined ? '已开启 Agent-Team 强制委派提醒。用 /using-agent-team off 关闭。'
       : '已开启 Agent-Team 强制委派，任务已转交给模型。用 /using-agent-team off 关闭。'
 
-/** 模型可见提醒消息（UserMessage 形态）：宿主 UI 按 source.kind/form 归类为 notice。 */
-function buildNotice(state) {
+/** 模型可见提醒消息（UserMessage 形态）：宿主 UI 按 source.kind/form 归类为 notice。caps 是本会话最近一次能力快照，notice 按它分档。 */
+function buildNotice(state, caps) {
   return {
     id: randomUUID(),
     role: 'user',
-    content: [{ type: 'text', text: reminderText(state) }],
+    content: [{ type: 'text', text: reminderText(state, caps) }],
     source: { kind: 'force-subagent', form: 'notice', summary: summaryText(state) },
   }
 }
@@ -468,43 +797,58 @@ function deliver(agent, method, message, warn) {
   }
 }
 
-/** 放行白名单：nested 成员只有精确命中的编排类与只读工具直接放行（不再走点名提醒），其余工具提醒一次后照常执行；插件不拒绝任何成员工具（前缀匹配会放过 mcp__ 委派工具，故不用）。 */
-const ALLOWED_TOOLS = new Set([
+/**
+ * 编排动作：只放行「派发 / 调度 / 看板 / 提问」这类不直接干活的工具，Lead 与成员调用都不提醒。
+ * 只列 rc.2 真实存在的名字（rc.1 的成员生命周期工具在 rc.2 已不存在，不再列）。
+ * team_task_* 的可用性由探测结果决定（见 isOrchestrationTool），不在静态集合里无条件放行。
+ */
+const ORCHESTRATION_TOOLS = new Set([
   'subagent',
   'subagent_fork',
-  'subagent_role',
-  'close_subagent',
   'workflow',
-  'team_task_create',
-  'team_task_get',
-  'team_task_list',
-  'team_task_update',
   'send_message',
   'wait_agent',
   'list_agents',
   'interrupt_agent',
-  'job_list',
-  'job_output',
-  'job_kill',
-  'skill',
   'todo_write',
-  'read',
-  'grep',
-  'glob',
+  'ask_user_question',
+  'skill',
 ])
 
-const isAllowedTool = (name) => typeof name === 'string' && ALLOWED_TOOLS.has(name)
+/** 只读校验工具（设计 §3.1「有条件豁免」）：本轮已派发成员后，Lead 用它们校验产物不再提醒。 */
+const VALIDATION_TOOLS = new Set(['read', 'grep', 'glob'])
 
-/** nested 模式成员越界的软提醒：工具已放行，文案直接给出正确做法（委派 + 看板登记）。 */
-const memberGateReminder = (tool) =>
-  `[team-gate] 提醒：Agent-Team 成员不该直接执行「${tool}」——本次已放行，但 nested 模式的正确做法是用 subagent / subagent_fork / workflow 委派子任务并在 team_task_* 登记；自己只做拆分、合并与校验。`
+/** job_* 是后台任务的读/杀，属于编排簿记：按前缀识别，避免每个版本逐个维护名字。 */
+const isJobTool = (name) => typeof name === 'string' && name.startsWith('job_')
 
-/** flat 模式下封死成员派子代理的工具集：ALLOWED_TOOLS 里的全部委派入口（少了 subagent_role / close_subagent 就会被绕过），其余工具一律由成员自己执行。 */
-const DELEGATION_TOOLS = new Set(['subagent', 'subagent_fork', 'subagent_role', 'close_subagent', 'workflow'])
+/**
+ * 编排动作判定：静态编排集合 + job_* + 看板工具（team_task_*）。
+ * 看板工具的两种放行口径：探测到 team_task_create（rc.2 Team 开关 ON）→ 放行；
+ * 探测失败（caps.probed === false，rc.1 或诊断上下文）→ 也放行，宁可少提醒一次，避免把真实看板调用误判成「下场干活」。
+ */
+const isOrchestrationTool = (name, caps) => typeof name === 'string'
+  && (ORCHESTRATION_TOOLS.has(name)
+    || isJobTool(name)
+    || (name.startsWith('team_task_') && (caps.board || !caps.probed)))
+
+/** 成员侧额外收紧：向用户提问是 Lead 的职责，成员直接 ask_user_question 仍按越界提醒（保持既有成员门禁口径）。 */
+const MEMBER_DISALLOWED_TOOLS = new Set(['ask_user_question'])
+
+/** nested 模式成员的白名单：编排动作 + 只读校验；其余工具提醒一次后照常执行（插件不拒绝任何成员工具）。 */
+const isAllowedTool = (name, caps) => (isOrchestrationTool(name, caps) && !MEMBER_DISALLOWED_TOOLS.has(name))
+  || VALIDATION_TOOLS.has(name)
+
+/** 成员越界的软提醒（nested）：工具已放行，文案直接给出只含真实工具名的正确做法。 */
+const memberGateReminder = (caps, tool) => {
+  const way = `用 subagent${caps.fork ? ' / subagent_fork' : ''}${caps.workflow ? ' / workflow' : ''} 委派子任务${caps.board ? '并在 team_task_* 登记' : caps.todo ? '并用 todo_write 登记' : ''}`
+  return `[team-gate] 提醒：Agent-Team 成员不该直接执行「${tool}」——本次已放行，但 nested 模式的正确做法是${way}；自己只做拆分、合并与校验。`
+}
+
+/** flat 模式下封死成员派子代理的工具集：只列 rc.2 真实存在的委派入口。 */
+const DELEGATION_TOOLS = new Set(['subagent', 'subagent_fork', 'workflow'])
 
 /** flat 模式成员试图派子代理的软提醒：放行 + 点名 flat 模式的正确动作。 */
-const flatGateReminder = (tool) =>
-  `[team-gate] 提醒：flat 模式只用成员，成员不派子代理——「${tool}」本次已放行，但它不是成员的动作：读文件、改代码、跑命令、跑测试一律由你自己执行，做完后用 send_message 把结果交回 Lead，由 Lead 判定完成并 interrupt_agent 收敛你。`
+const flatGateReminder = (caps, tool) => `[team-gate] 提醒：flat 模式只用成员，成员不派子代理——「${tool}」本次已放行，但它不是成员的动作：读文件、改代码、跑命令、跑测试一律由你自己执行，做完后用 send_message({ agent: 成员名, message: 结果 }) 把结果交回 Lead${caps.interrupt ? '，由 Lead 判定完成并 interrupt_agent 收敛你' : '，由 Lead 判定完成'}。`
 
 /**
  * Lead 取证提醒的点名工具：只列「取证 / 执行动作」（跑命令、读文件、读图片、搜内容、列文件、抓网页、搜网页），
@@ -514,7 +858,8 @@ const flatGateReminder = (tool) =>
  * packages/shell/tool-pwsh/src/index.ts:385）。持久化 pwsh（packages/shell/tool-pwsh-persistent/src/index.ts:428）
  * 注册的模型可见工具名同样是 `pwsh`，与 tool-pwsh 共用同一个名字，因此一条 'pwsh' 同时覆盖前台与持久化两条路。
  * 已知未覆盖：MCP 工具（模型可见名为 `mcp__<server>__<tool>`，由服务器自行决定、逐名点名不可行）不进本集合，
- * 只靠 LEAD_NUDGE 的委派要求承担告知。
+ * MCP 工具（模型可见名为 `mcp__<server>__<tool>`，逐名点名不可行）与其它未枚举工具不再依赖本集合：
+ *   门禁改为「凡不在编排动作集合内即提醒」，未知工具一律按硬接管处理（见 isOrchestrationTool）。
  */
 const EVIDENCE_TOOLS = new Set(['bash', 'read', 'grep', 'glob', 'web_fetch', 'web_search', 'read_image', 'pwsh'])
 
@@ -542,29 +887,40 @@ const IMPLEMENTATION_TOOLS = new Set(['write', 'edit', 'apply_patch', 'str_repla
  */
 const EXECUTION_TOOLS = new Set(['run_code', 'terminal_open', 'terminal_read', 'terminal_send', 'terminal_signal'])
 
-/** Lead 侧提醒触发集合 = 取证类 + 实现类 + 执行类：命中它只触发「本轮未派发」提醒，不构成拦截，插件不因此拒绝任何工具调用。委派与编排类工具（team_task_* / subagent 系列 / send_message / wait_agent / list_agents / interrupt_agent）一律不在其列。 */
-const LEAD_BLOCKED_TOOLS = new Set([...EVIDENCE_TOOLS, ...IMPLEMENTATION_TOOLS, ...EXECUTION_TOOLS])
+/** 「本轮已经派发过成员」的判据：本 turn 内出现过委派类 tool/call（只认 rc.2 真实存在的委派入口）。 */
+const DISPATCH_TOOLS = new Set(['subagent', 'subagent_fork', 'workflow'])
 
-/** 「本轮已经把活派出去了」的判据：本 turn 内出现过委派类 tool/call 事件。spawn_teammate 只在 rc.1 存在，保留是为了同一份判据在 rc.1 上仍然成立。 */
-const DISPATCH_TOOLS = new Set(['spawn_teammate', 'subagent', 'subagent_fork', 'subagent_role', 'workflow'])
-
-/** 被点名工具在提醒文案里的归类名：实现类 / 执行类 / 取证类。三类的判据与出路完全相同，只有称呼不同。 */
+/** 被点名工具在提醒文案里的归类名：实现类 / 执行类 / 取证类 / 其它（含 mcp__* 等未知工具）。 */
 const leadGateToolCategory = (tool) => {
   if (IMPLEMENTATION_TOOLS.has(tool)) return '实现工具'
   if (EXECUTION_TOOLS.has(tool)) return '执行工具'
-  return '取证工具'
+  if (EVIDENCE_TOOLS.has(tool)) return '取证工具'
+  return '工具'
 }
 
-/** Lead 本轮未派发时的提醒正文：点名工具（取证类 / 实现类 / 执行类）与正确做法；工具照常执行，不构成拒绝。 */
-const leadGateReminder = (tool) =>
-  `[team-gate] 提醒：本轮还没有派发成员，${leadGateToolCategory(tool)}「${tool}」仍会照常执行。正确做法：先 team_task_create 把工作拆成互不依赖的小任务（write_scopes 互斥、blocked_by 只写真实依赖），再在单轮内 subagent 并行派成员承接${EXECUTION_TOOLS.has(tool) ? '——执行工具本身就是取证与实现的等价通道' : ''}。实现与取证都必须委派，Lead 只做拆分、派发、合并与校验；本轮派发之后不再重复提醒，新的 turn 开始后会再提醒一次。`
+/**
+ * Lead 亲自下场时的提醒正文：两态（本轮未派发 / 本轮已派发），都只提探测到的真实工具名。
+ * 第三种（探测不到任何委派工具）直说没有委派能力、直接执行——不教不存在的工具，也不静默。
+ */
+const leadGateReminder = (caps, tool, dispatched) => {
+  const category = leadGateToolCategory(tool)
+  if (delegationTier(caps) === 'none') {
+    return `[team-gate] 提醒：本会话没有探测到委派工具（subagent / subagent_fork 都不可用），无法派发成员，${category}「${tool}」由你直接执行。本次调用已放行；本 turn 只提醒一次。若宿主本应提供委派能力，请检查 subagent 服务与派发深度上限（maxDepth）。`
+  }
+  if (dispatched) {
+    return `[team-gate] 提醒：本轮已派发成员，但你仍在亲自执行${category}「${tool}」——派发不等于放手：实现与执行必须由成员完成，Lead 只做拆分、派发、合并与校验。本次调用已放行；本 turn 只提醒一次，新的 turn 开始后会再提醒一次。`
+  }
+  return `[team-gate] 提醒：本轮还没有派发成员，${category}「${tool}」仍会照常执行。正确做法：${planningHint(caps)}，${dispatchHint(caps)}；Lead 只做拆分、派发、合并与校验。本次调用已放行；本 turn 只提醒一次，新的 turn 开始后会再提醒一次。`
+}
 
-const waitGateReminder = () =>
-  '[team-gate] 提醒：连续两次 wait_agent 之间没有任何有效动作，本次等待已放行，但同一 turn 只允许等待一次。先用 list_agents 与 team_task_list 处理已有结果（已结束的队友、completed/ready 任务），或直接推进任务。'
+/** wait_agent 空转提醒：点名当前真实存在的处理入口（看板 / 任务板）。 */
+const waitGateReminder = (caps) => {
+  const board = caps.board ? 'team_task_list' : caps.todo ? 'todo_write 的任务状态' : '已有结果'
+  return `[team-gate] 提醒：连续两次 wait_agent 之间没有任何有效动作，本次等待已放行，但同一 turn 只允许等待一次。先用 list_agents 与 ${board} 处理已有结果（已结束的队友、已完成任务），或直接推进任务。`
+}
 
-/** 已完成成员门禁的软提醒文案：点名被劝阻的动作与成员，并给出唯一出路（新建成员）。前缀 [team-gate] TEAM_MEMBER_FINISHED: 保持不变，供测试断言。 */
-const finishedMemberReminder = (subject) =>
-  `[team-gate] TEAM_MEMBER_FINISHED: ${subject} 已被判定为「已完成任务」——其名下任务全部处于 completed / deleted。本次调用已放行，但已完成成员不能再承接新任务：宿主没有删除成员的 API，interrupt_agent 也只中断 turn 不删记录，成员在委派记录里仍然存在。正确做法是再 subagent 派一个新成员承接，并给它建新的 team_task；不要继续向该成员 send_message，也不要把任务 claim / reassign 给它。`
+/** 已完成成员门禁的软提醒：interrupt_agent 不可用时不得再写软踢出流程。前缀保持不变，供测试断言。 */
+const finishedMemberReminder = (caps, subject) => `[team-gate] TEAM_MEMBER_FINISHED: ${subject} 已被判定为「已完成任务」——其名下任务全部处于 completed / deleted。本次调用已放行，但已完成成员不能再承接新任务：${caps.interrupt ? '宿主没有删除成员的 API，interrupt_agent 也只中断 turn 不删记录，成员在委派记录里仍然存在。' : '宿主没有删除成员的 API，成员在委派记录里仍然存在。'}正确做法是${relaunchPhrase(caps)}承接${caps.board ? '，并给它建新的 team_task' : ''}；不要继续向该成员 send_message，也不要把任务 claim / reassign 给它。`
 
 /**
  * 命令输入 → 会话状态。空串与 `on`（忽略大小写）= 开启且无 task；`off` = 关闭；
@@ -819,6 +1175,208 @@ export async function setCapacity(ctx, value, options = {}) {
 /** 容量来源的人话标签（供面板与命令文案复用）。 */
 export const capacitySourceLabel = (source) => CAPACITY_SOURCE_LABEL[source] ?? String(source)
 
+/**
+ * ── 内置 skills 注册 ─────────────────────────────────────────────────────────
+ * 本插件包内的 `skills/<name>/SKILL.md` 注册进宿主 `ctx.skills`，协议与宿主打包 provider 同形
+ * （宿主先例：superpowers-dsh/lib/index.js:122 与 @deepseek-ai/dsh-skill-filesystem/src/index.ts:135）：
+ *   list() 只发现候选（frontmatter 出 name / description，正文留到 get() 才读）；
+ *   get() 解析完整定义，并给出 `{ kind: 'directory' }` 的 resourceBase 供正文里的相对引用。
+ * 目录位置是包自身的装配事实（由 import.meta.url 推出），不是用户配置。
+ * skills 服务缺失时安静降级：内置 skills 是增值能力，不能拿门禁 / 提示主功能去换。
+ * 真实的 FS 或解析错误不吞：ENOENT 以外的失败 warn 一次（同一原因只一次，避免每次目录刷新刷屏）。
+ */
+const SKILLS_PROVIDER_NAME = 'dsh-force-subagent'
+/** 打包 provider 的注册优先级：低于本地 bundled root，与宿主打包 provider 同一口径。 */
+const PACKAGED_SKILL_RANK = 550
+/** prompt 可见的来源桶（不是优先级）。 */
+const SKILL_SOURCE = 'custom'
+/** 宿主 skill 名语法（packages/skill/skill/src/index.ts:21 SKILL_NAME）；不合法的名字注册表不会接受。 */
+const SKILL_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
+/** 本包的 skills 目录：`<包目录>/skills`。目录不存在时 list() 就是空集合。 */
+export const PACKAGED_SKILLS_ROOT = join(dirname(fileURLToPath(import.meta.url)), 'skills')
+/**
+ * 同因只告警一次：目录读失败会在每次 catalog 刷新时重来一遍。
+ * warn-once 的确切语义：模块级 Set、每进程一次，去重键是「问题键」（告警文案本身 —— 出问题的目录 /
+ * 失败原因）。同一问题在本进程内只提醒一次，之后无论刷新多少次都不再重复告警；不是「每次加载都提醒」。
+ * 跨进程（重启或热重载后重新 apply 插件、模块重新求值）才会重新计数。
+ */
+const warnedSkillIssues = new Set()
+
+/**
+ * 解析 SKILL.md 的 YAML frontmatter：只消费宿主会用到的标量（name / description / whenToUse），
+ * 其余标量 metadata 原样透传。没有 frontmatter 块返回 null（不是错误，但这条 SKILL.md 不可用）。
+ */
+export function parseSkillFrontmatter(text) {
+  if (typeof text !== 'string' || !text.startsWith('---')) return null
+  const end = text.indexOf('\n---', 3)
+  if (end === -1) return null
+  const block = text.slice(3, end)
+  const body = text.slice(end + 4).replace(/^\n+/, '')
+  const metadata = {}
+  for (const line of block.split('\n')) {
+    const match = /^([A-Za-z][\w-]*):\s*(.*)$/.exec(line.trim())
+    if (!match) continue
+    let value = match[2].trim()
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1)
+    }
+    metadata[match[1]] = value
+  }
+  return { metadata, body }
+}
+
+/** 读一个 skill 目录的 SKILL.md。ENOENT = 该目录没有 SKILL.md（正常情况，安静跳过）；其它失败 warn 一次。 */
+async function readSkillFile(skillFile, { signal, onError } = {}) {
+  let text
+  try {
+    text = await readFile(skillFile, { encoding: 'utf8', signal })
+  } catch (error) {
+    if (error?.code !== 'ENOENT') onError?.(`读取 ${skillFile} 失败，该内置 skill 本次不可用：${errText(error)}`)
+    return undefined
+  }
+  if (signal?.aborted) return undefined
+  const parsed = parseSkillFrontmatter(text)
+  if (parsed === null) {
+    onError?.(`${skillFile} 没有 YAML frontmatter，内置 skill 已跳过（name / description 无从取得）。`)
+    return undefined
+  }
+  return parsed
+}
+
+/** frontmatter → 候选 / 定义的核心字段；名字缺省时用目录名（`<name>/SKILL.md` 的既有约定）。 */
+function skillFields(parsed, { dirName, skillFile }) {
+  const declared = typeof parsed.metadata.name === 'string' ? parsed.metadata.name.trim() : ''
+  const skillName = declared !== '' ? declared : dirName
+  if (!SKILL_NAME_RE.test(skillName)) {
+    return { error: `${skillFile} 的 skill 名 ${JSON.stringify(skillName)} 不符合宿主语法（小写字母 / 数字 / 连字符）` }
+  }
+  const description = typeof parsed.metadata.description === 'string' ? parsed.metadata.description : ''
+  const whenToUse = typeof parsed.metadata.whenToUse === 'string' ? parsed.metadata.whenToUse : undefined
+  const metadata = Object.keys(parsed.metadata).length > 0 ? parsed.metadata : undefined
+  return {
+    fields: {
+      name: skillName,
+      description,
+      ...(whenToUse !== undefined ? { whenToUse } : {}),
+      invocation: { modelInvocable: true, userInvocable: true },
+      source: SKILL_SOURCE,
+      provider: SKILLS_PROVIDER_NAME,
+      ...(metadata !== undefined ? { metadata } : {}),
+    },
+  }
+}
+
+/** 扫描 skills 根目录，一个子目录一个候选；正文留到 get() 才读。 */
+export async function listPackagedSkillCandidates(skillsRoot, { signal, onError } = {}) {
+  let entries
+  try {
+    entries = await readdir(skillsRoot, { withFileTypes: true })
+  } catch (error) {
+    // ENOENT = 本包没有自带 skills 目录：不是故障，安静按空集合处理。
+    if (error?.code !== 'ENOENT') onError?.(`读取内置 skills 目录 ${skillsRoot} 失败，内置 skills 本次未启用：${errText(error)}`)
+    return []
+  }
+  const candidates = []
+  for (const entry of entries) {
+    if (signal?.aborted) break
+    if (!entry.isDirectory()) continue
+    const locator = join(skillsRoot, entry.name)
+    const path = join(locator, 'SKILL.md')
+    const parsed = await readSkillFile(path, { signal, onError })
+    if (parsed === undefined) continue
+    const { fields, error } = skillFields(parsed, { dirName: entry.name, skillFile: path })
+    if (error !== undefined) {
+      onError?.(error)
+      continue
+    }
+    candidates.push({ ...fields, rank: PACKAGED_SKILL_RANK, locator, path })
+  }
+  return candidates
+}
+
+/** 造 provider：宿主 registerProvider 的 create 回调形状（control 由宿主生命周期提供）。 */
+export function createPackagedSkillProvider(skillsRoot = PACKAGED_SKILLS_ROOT, onError) {
+  return () => ({
+    name: SKILLS_PROVIDER_NAME,
+    async list(options) {
+      return listPackagedSkillCandidates(skillsRoot, { signal: options?.signal, onError })
+    },
+    async get(candidate, options) {
+      const locator = typeof candidate?.locator === 'string' && candidate.locator.length > 0 ? candidate.locator : skillsRoot
+      const skillFile = typeof candidate?.path === 'string' && candidate.path.length > 0 ? candidate.path : join(locator, 'SKILL.md')
+      const parsed = await readSkillFile(skillFile, { signal: options?.signal, onError })
+      if (parsed === undefined) return undefined
+      const { fields, error } = skillFields(parsed, { dirName: basename(locator), skillFile })
+      if (error !== undefined) {
+        onError?.(error)
+        return undefined
+      }
+      return {
+        ...fields,
+        resourceBase: { kind: 'directory', path: locator },
+        path: skillFile,
+        content: parsed.body,
+      }
+    },
+  })
+}
+
+/** 注册入口：优先延迟注入（inject 缺服务不会让插件不 apply），退化路径直接 ctx.get('skills')。 */
+export function installSkillsProvider(ctx, { skillsRoot = PACKAGED_SKILLS_ROOT } = {}) {
+  const warnSkills = (detail) => {
+    if (warnedSkillIssues.has(detail)) return
+    warnedSkillIssues.add(detail)
+    ctx?.logger?.warn?.(`[force-subagent] 内置 skills：${detail}`)
+  }
+  const hasSkills = (skills) => skills !== undefined && skills !== null && typeof skills.registerProvider === 'function'
+  const create = createPackagedSkillProvider(skillsRoot, warnSkills)
+
+  if (typeof ctx?.inject === 'function') {
+    let providerRegistered = false
+    ctx.inject(['skills'], (child) => {
+      const skills = child?.skills
+      // 服务缺失（headless 组合 / 未装 skill 层的宿主）：安静降级，不抛也不 warn。
+      if (!hasSkills(skills)) return
+      try {
+        // registerProvider 返回注销器：必须挂到这个注入 scope 的 effect 上，插件卸载 / 热重载时
+        // 才会把这条 provider 从 skills 服务里摘掉；丢着不管会让重复 apply 叠加同名 provider。
+        const dispose = skills.registerProvider(create)
+        providerRegistered = true
+        if (typeof dispose === 'function' && typeof child?.effect === 'function') {
+          child.effect(() => dispose, 'force-subagent:skills provider')
+        } else if (typeof dispose === 'function') {
+          warnSkills('注入上下文没有 effect 通道，内置 skills provider 无法随插件卸载释放。')
+        }
+      } catch (error) {
+        warnSkills(`provider 注册失败，内置 skills 未启用：${errText(error)}`)
+      }
+    })
+    // registered 只回答「provider 是否确实已经注册进宿主 skills 服务」：注入是延迟的，
+    // 服务缺失、注册失败或回调还没轮到执行时一律 false，不得谎报成功。
+    return { registered: providerRegistered, via: 'inject' }
+  }
+
+  let skills
+  try {
+    skills = ctx?.get?.('skills')
+  } catch (error) {
+    warnSkills(`读取 skills 服务失败，内置 skills 未启用：${errText(error)}`)
+    return { registered: false, via: 'get' }
+  }
+  if (!hasSkills(skills)) return { registered: false, via: 'get' }
+  try {
+    const dispose = skills.registerProvider(create)
+    // 退化路径没有注入 scope 托管注销器：交给 ctx.effect，卸载时释放这条 provider。
+    if (typeof dispose === 'function' && typeof ctx?.effect === 'function') {
+      ctx.effect(() => dispose, 'force-subagent:skills provider')
+    }
+    return { registered: true, via: 'get' }
+  } catch (error) {
+    warnSkills(`provider 注册失败，内置 skills 未启用：${errText(error)}`)
+    return { registered: false, via: 'get' }
+  }
+}
+
 export function apply(ctx, config = {}) {
 
   // 关闭宿主自动设置页：本插件自带浏览器页面与侧栏图标，避免设置对话框里多出一个重复的齿轮入口
@@ -848,6 +1406,10 @@ export function apply(ctx, config = {}) {
       }
     }, 'force-subagent: settings page policy')
   })
+
+  // 内置 skills 与设置页策略同一口径：走延迟注入，不把 'skills' 写进 inject —— 那会让没装 skill 层的
+  // 宿主整个插件都不 apply（门禁静默失效）。服务缺失时安静降级，真实读取失败 warn 一次。
+  installSkillsProvider(ctx)
 
   // 成员容量与嵌套深度不在本插件的命名空间：面板直接读写 `subagent` 命名空间，/team-limit 走 setCapacity；
   // 插件不监听 settings/document-updated，也不写任何 patch 文件（rc.2 的 agent-team 不接受成员上限键）。
@@ -901,12 +1463,111 @@ export function apply(ctx, config = {}) {
   /** 实时 mode：只有全局设置这一个来源（页面也只有一个下拉）。读配置失败沿用现成 fail-open：liveConfig 已 warn-once 回退 apply 快照，返回值只会是 'flat' 或 'nested'。 */
   const modeFor = () => resolveConfig(liveConfig(ctx, config), configWarn).mode
 
+  /**
+   * 工具面探测（R1）：按 rc.2 的 tools 服务派生「本步真实可用工具集」，注入文案与门禁都从它派生，
+   * 不再静态断言工具存在。源码依据：
+   * - `definitions(scope, toolSet)` 见 packages/core/tools/src/index.ts:305；`get(name, scope, toolSet)`
+   *   见同文件 :239-241；
+   * - **必须传本步 toolSet**：省略时只读注册期可见集合（同文件 :239-241），而 team_task_* 带
+   *   `{ when: enabled(agent) }` 注册（packages/team/tool-agent-team/src/index.ts:118-234），
+   *   Team 开关 OFF 时会被误判为可用；
+   * - 本步 toolSet 的来源：系统提示装配走 `AssembleContext.toolSet`（模块扩展见
+   *   packages/core/tools/src/index.ts:19-23，agent-loop 在 packages/core/agent-loop/src/agent.ts:298-300 注入），
+   *   工具执行走 `ToolExecution.toolSet`（packages/core/tools/src/executor.ts:32-37）；
+   * - 宿主内置 section 的同一写法见 packages/subagent/tool-subagent-control/src/index.ts:90-105
+   *   （`text: ({ agent, scope, toolSet }) => ctx.tools.get(name, scope, toolSet)`）。
+   * 降级链（设计 §1.4）：tools 服务缺失 / toolSet 缺失 / definitions 抛错 → 标准档安全默认，
+   * 每次 apply 只 warn 一次，绝不抛。
+   */
+  let warnedToolProbe = false
+  const noteToolProbeFallback = (detail) => {
+    if (warnedToolProbe) return
+    warnedToolProbe = true
+    ctx.logger?.warn?.(`[force-subagent] ${detail}，工具面探测降级为标准委派文案（只提 rc.2 稳定存在的委派工具）。`)
+  }
+  /**
+   * 本会话最近一次能力快照（探测成功或降级都算一次快照）。
+   * 命令 handler 没有 step toolSet（命令调用不带工具面），notice 只能按最近一次能力快照分文案；
+   * 快照没探过或探测失败（probed !== true）时由 leadClause 走中性句，不凭空再探一次、也不凭空造一条 warn。
+   */
+  let latestCaps
+  const rememberCaps = (caps) => { latestCaps = caps; return caps }
+  /**
+   * toolSet 缺失时的兜底能力：rc.1 没有 step toolSet 概念，用宿主 Team 开关还原「看板是否真实可用」，
+   * 避免 rc.1（有 team 工具）被误降级成 standard 文案；rc.2 Team 开关 ON 但没有 toolSet 时同样适用。
+   * isEnabled 抛错只走 warn-once，不阻断。
+   */
+  const fallbackCapabilities = (agent) => {
+    try {
+      const teamService = typeof ctx.get === 'function' ? ctx.get(AGENT_TEAMS_SERVICE) : undefined
+      if (teamService !== undefined && teamService !== null && typeof teamService.isEnabled === 'function'
+        && teamService.isEnabled(agent) === true) {
+        return Object.freeze({ ...STANDARD_CAPABILITIES, board: true })
+      }
+    } catch (error) {
+      noteToolProbeFallback(`读取 Team 开关失败（${error instanceof Error ? error.message : String(error)}），无法还原看板能力`)
+    }
+    return STANDARD_CAPABILITIES
+  }
+  /** 探测结果按 toolSet 对象缓存：同一 step 内多次调用只扫一次；toolSet 随 step 回收，WeakMap 不泄漏。 */
+  const capabilitiesCache = new WeakMap()
+  const capabilitiesFor = (context) => {
+    const toolSet = context?.toolSet
+    if (toolSet !== null && typeof toolSet === 'object') {
+      const cached = capabilitiesCache.get(toolSet)
+      if (cached !== undefined) return rememberCaps(cached)
+    }
+    const tools = typeof ctx.get === 'function' ? ctx.get('tools') : undefined
+    if (tools === undefined || tools === null || typeof tools.definitions !== 'function') {
+      noteToolProbeFallback('宿主 tools 服务不可用（无法读取本会话真实工具清单）')
+      return rememberCaps(fallbackCapabilities(context?.agent))
+    }
+    if (toolSet === undefined || toolSet === null) {
+      noteToolProbeFallback('当前步 toolSet 缺失（省略 toolSet 会读到注册期可见集合，team_task_* 会假阳性）')
+      return rememberCaps(fallbackCapabilities(context?.agent))
+    }
+    try {
+      // scope 就是宿主本步 consult 这个 toolSet 用的键：ResolvedToolSet 由解析它的 agent 持有，
+      // view(scope) 只认同一 agent（packages/core/tools/src/index.ts:284-290），
+      // 工具执行侧同样用 exec.agent（packages/core/tools/src/pipeline.ts:107 / :127）；
+      // 系统提示装配侧宿主直接给出 scope === agent（packages/core/agent/src/dispatch.ts:174-176：assembleContextFor 返回 { agent, scope: agent }）。
+      const scope = context?.scope ?? context?.agent
+      const names = new Set()
+      for (const definition of tools.definitions(scope, toolSet)) {
+        if (typeof definition?.name === 'string') names.add(definition.name)
+      }
+      if (names.size === 0) {
+        // 空清单不是「确认本会话没有委派工具」：toolSet 已 dispose、或 scope 与本步解析者不一致时，
+        // 宿主 view() 一律返回空 Map（packages/core/tools/src/index.ts:286）。
+        // 把它当成 none 档会让文案与门禁反过来劝 Lead 自己干活，而且没有任何 warn 可追查——
+        // 按探测失败走安全默认档（Team 开关还原 / 标准委派文案）并 warn 一次。
+        noteToolProbeFallback('工具面探测结果为空（toolSet 可能已 dispose，或 scope 与本步解析者不一致）')
+        const fallback = fallbackCapabilities(context?.agent)
+        // 同一个 toolSet 对象的同一判据不会变（已释放就是已释放），缓存住免得同一 step 反复探测。
+        capabilitiesCache.set(toolSet, fallback)
+        return rememberCaps(fallback)
+      }
+      const caps = capabilitiesFromNames(names)
+      capabilitiesCache.set(toolSet, caps)
+      return rememberCaps(caps)
+    } catch (error) {
+      noteToolProbeFallback(`工具面探测抛错（${error instanceof Error ? error.message : String(error)}）`)
+      const fallback = fallbackCapabilities(context?.agent)
+      // 与空结果那一支同理：缓存的是「该 toolSet 的能力快照」，与这次是探测成功还是降级无关；
+      // 同一 toolSet 的判据不会变（抛错的宿主实现不会中途变好），免得同一 step 内反复调 definitions 反复抛。
+      if (toolSet !== null && typeof toolSet === 'object') capabilitiesCache.set(toolSet, fallback)
+      return rememberCaps(fallback)
+    }
+  }
+
   // 成员软门禁：不依赖提示词自觉，判定发生在工具执行前，但只放行 + 提醒，不再拦死工具调用。监听器抛异常会让工具整体失败，故自带 catch 兜底放行。
   ctx.on('tools/pre-execute', async (exec, next) => {
     const tool = exec?.name
     try {
       const agent = exec?.agent
       if (agent === undefined) return next()
+      // 能力快照（R1）：本批调用所属 step 的真实工具面；探测失败时是标准档安全默认。
+      const caps = capabilitiesFor(exec)
       // 身份判定：rc.1 走 agentTeams.tryMembership，rc.2 走 ctx.subagents.rootOf（见 resolveMembership）。
       let identityUnavailable = false
       const membership = resolveMembership(ctx, agent, (detail) => {
@@ -947,7 +1608,7 @@ export function apply(ctx, config = {}) {
               }
               const turnEvents = lastTurnStart < 0 ? waitEvents : waitEvents.slice(lastTurnStart + 1)
               // 宿主在 prepare(call.exec) 之前就把本次调用自身的 tool/call 写入 session
-              // （packages/core/agent-loop/src/tool-calls.ts:168→170），不排除就会每次命中自己、每次都提醒。
+              // （packages/core/tools/src/batch.ts:157 先 settlement.start，:243-249 才 append('tool/call', { callId: block.id })；pipeline.ts:120 的 exec.callId 与之同源），不排除就会每次命中自己、每次都提醒。
               const currentCallId = exec?.callId
               let lastCall
               for (let index = turnEvents.length - 1; index >= 0; index -= 1) {
@@ -958,7 +1619,7 @@ export function apply(ctx, config = {}) {
                 break
               }
               if (lastCall?.data?.name === 'wait_agent') {
-                remindOnce(agent, 'wait-spin', waitGateReminder())
+                remindOnce(agent, 'wait-spin', waitGateReminder(caps))
                 return next()
               }
             }
@@ -966,11 +1627,14 @@ export function apply(ctx, config = {}) {
         }
       }
       // 已完成成员门禁：send_message 复用已完成成员、team_task_update 把任务交给已完成成员，判定后放行并投递一次提醒。
-      // 必须排在下面成员门禁之前——send_message / team_task_update 都在 ALLOWED_TOOLS 里，排后面会被
+      // 必须排在下面成员门禁之前——send_message / team_task_update 都算编排动作，排后面会被
       // flat 的提前 return 或 nested 白名单放行短路。sender 是谁都拦（Lead 与其它成员同样受拦）。
       const callArgs = exec?.arguments !== null && typeof exec?.arguments === 'object' ? exec.arguments : undefined
       const callAction = typeof callArgs?.action === 'string' ? callArgs.action : undefined
-      if (tool === 'send_message' || (tool === 'team_task_update' && (callAction === 'claim' || callAction === 'reassign'))) {
+      // 设计 §3.5：standard 档停用本门禁——rc.2 不写 team/member 事件、send_message 用成员名寻址，
+      // 没有看板就没有「成员名下任务全部 completed」这个判据；此时纪律由注入文案承担。
+      // team 档（有 team_task_create）保留完整判定。
+      if (caps.board && (tool === 'send_message' || (tool === 'team_task_update' && (callAction === 'claim' || callAction === 'reassign')))) {
         // Team 事件只写在 Lead（root）会话上（宿主 journal.appendAndFlush(root, …)）；成员会话上没有，
         // 所以必须走 membership.root.session。读不到一律沿用既有 fail-open：warn 一次后放行。
         const teamSession = membership?.root?.session ?? agent?.session
@@ -991,31 +1655,23 @@ export function apply(ctx, config = {}) {
             let memberId
             let subject
             if (tool === 'send_message') {
-              // rc.1 用名字寻址（target）；rc.2 的 send_message 只认 agent_id（Session id），名字寻址已删除。
-              const name = typeof callArgs?.target === 'string' ? callArgs.target.trim() : ''
-              const directId = typeof callArgs?.agent_id === 'string' ? callArgs.agent_id.trim() : ''
-              memberId = idsByName.get(name) ?? (directId.length > 0 ? directId : undefined)
-              subject = name.length > 0 ? `send_message 的目标成员「${name}」` : `send_message 的目标会话 ${directId}`
+              // rc.2 的 send_message 参数是 { agent: 成员名, message }（docs/tool-catalog.md:2313）；
+              // 旧的 target / agent_id 寻址已删除，这里只读 agent，不再猜兼容参数。
+              const name = typeof callArgs?.agent === 'string' ? callArgs.agent.trim() : ''
+              memberId = await memberByName(name, idsByName, ctx, agent, exec.signal)
+              subject = name.length > 0 ? `send_message 的目标成员「${name}」` : 'send_message 的目标成员'
             } else if (callAction === 'claim') {
               // 宿主用名字寻址成员，但 claim 的承接者就是调用者本人，成员 id === 其 Agent id（roster.ts:96-98）。
               memberId = agent?.id
               subject = `claim 新任务的成员「${membership?.name ?? agent?.id}」（你自己）`
             } else {
               const name = typeof callArgs?.owner === 'string' ? callArgs.owner.trim() : ''
-              memberId = idsByName.get(name)
-              if (memberId === undefined && name.length > 0 && typeof ctx.get('subagents')?.resolveName === 'function') {
-                // rc.2：看板 owner 仍是模型侧名字，宿主自己经 subagents.resolveName 解析成 Session id；门禁同一口径解析一次。
-                try {
-                  memberId = String(await ctx.get('subagents').resolveName(agent, name, exec.signal))
-                } catch (error) {
-                  // 名字解析不了（树里没有这个名字）就不是判定对象：按「判不了就不提醒」的既有口径放行，不 warn。
-                  void error
-                }
-              }
+              // rc.2：看板 owner 与 send_message 的成员名是同一套模型侧寻址，走同一个解析口径。
+              memberId = await memberByName(name, idsByName, ctx, agent, exec.signal)
               subject = `team_task_update action=reassign 指定的 owner「${name}」`
             }
             if (memberId !== undefined && finished.has(memberId)) {
-              remindOnce(agent, `finished-member:${memberId}`, finishedMemberReminder(subject))
+              remindOnce(agent, `finished-member:${memberId}`, finishedMemberReminder(caps, subject))
               return next()
             }
           } else if (!Array.isArray(teamEvents)) {
@@ -1028,29 +1684,29 @@ export function apply(ctx, config = {}) {
         // flat 模式：成员自己执行，只封死派子代理这条路；白名单不再限制成员的其余工具。
         if (modeFor() === 'flat') {
           if (DELEGATION_TOOLS.has(tool) && enabledIn(membership.root?.session)) {
-            remindOnce(agent, 'flat-delegation', flatGateReminder(tool))
+            remindOnce(agent, 'flat-delegation', flatGateReminder(caps, tool))
           }
           return next()
         }
-        // nested 模式（默认）：白名单短路只对成员生效——read / grep / glob 同时在 ALLOWED_TOOLS，若提前放行会绕过下面的 Lead 取证门禁。
-        if (isAllowedTool(tool)) return next()
+        // nested 模式（默认）：编排动作短路只对成员生效——read / grep / glob 属于校验集合，若提前放行会绕过下面的 Lead 取证门禁。
+        if (isAllowedTool(tool, caps)) return next()
         // 开关取 Lead（root）会话：成员会话没有自己的 command/run 记录。
         if (enabledIn(membership.root?.session)) {
-          remindOnce(agent, 'member-gate', memberGateReminder(tool))
+          remindOnce(agent, 'member-gate', memberGateReminder(caps, tool))
         }
       }
-      // Lead 门禁：补上成员门禁管不到的另一半——Lead 自己下场取证（bash / pwsh / read / read_image / grep / glob / web_fetch / web_search）、
-      // 下场实现（write / edit / apply_patch / str_replace_editor）或下场执行（run_code / terminal_open / terminal_read /
-      // terminal_send / terminal_signal），而不是 team_task_create 拆分后 spawn_teammate 交出去。
-      // 只提醒取证不提醒动手没有意义：Lead 被提醒 bash 后转而 write / edit 就把活做掉了；同理转而
-      // run_code（程序里读文件写文件跑命令）或 terminal_open（跨 turn 的持久 shell）同样把活做掉了。判定口径：会话已开启命令，且「本轮」
-      // （事件里最后一个 turn/start 之后）没有委派类 tool/call（spawn_teammate / subagent 系列 / workflow），
-      // 就投递一条提醒，工具照常执行。会话里是否还有 running 成员、本轮是否 interrupt_agent 过成员，都不参与判定；
-      // 单靠 team_task_create 不算已派发。
-      // 去重令牌 = 最后一个 turn/start 在事件序列里的下标：同一轮只提醒一次，新的 turn/start 到来 → 令牌变化 → 重新提醒一次。
+      // Lead 门禁（R3）：监控面 = 「除编排动作以外的全部工具」——不再维护 17 个硬编码工具名，
+      // mcp__* / office_* / present 等未枚举工具同样命中（isOrchestrationTool 之外一律按下场处理）。
+      // 规则（设计 §3.1 / §3.2）：
+      // - 实现 / 执行 / 外部取证 / 未知工具：每个 turn 首次触发一次 [team-gate]，与「本轮是否已派发」无关；
+      // - read / grep / glob：仅在本轮已派发成员后视为「校验产物」豁免，未派发时照样提醒；
+      // - 已派发成员**不构成整轮豁免**：旧实现「本轮出现过 DISPATCH_TOOLS 就整轮静默」让 Lead 派一次
+      //   subagent 换整轮自由（S1），这条已删除；
+      // - 提醒始终是 notice（remindOnce → agent.inject + notice 形态），不 deny、不阻断。
+      // 去重令牌 = 最后一个 turn/start 在事件序列里的下标：同一轮只提醒一次（两种态共用），跨轮重新提醒。
       // 拿不到判定依据（无 session / 事件读不到 / 找不到 turn/start / 读取抛错）一律 fail-open：
       // 不提醒、放行工具调用，只 warn 一次，避免把宿主卡死或刷屏。
-      if (membership?.role !== 'teammate' && LEAD_BLOCKED_TOOLS.has(tool)) {
+      if (membership?.role !== 'teammate' && !isOrchestrationTool(tool, caps)) {
         // 子代理（subagent/fork）同样没有 membership，且 fork 会继承父会话事件前缀；用会话头 delegationDepth≥1 排除，避免 Lead 派出的取证 subagent 被自家门禁拦死。
         let depth
         try {
@@ -1062,7 +1718,7 @@ export function apply(ctx, config = {}) {
         if (Number(depth) >= 1) return next()
         const session = agent?.session
         if (session === undefined || session === null) {
-          warnFailOpen(tool, '无法定位会话（exec.agent.session 缺失），无法判定本轮是否已 team_task_create')
+          warnFailOpen(tool, '无法定位会话（exec.agent.session 缺失），无法判定本轮是否已派发成员')
           return next()
         }
         let enabled
@@ -1075,7 +1731,7 @@ export function apply(ctx, config = {}) {
         if (!enabled) return next()
         const events = readEvents(session)
         if (!Array.isArray(events)) {
-          warnFailOpen(tool, '会话事件不可读（readEvents 无返回），无法判定本轮是否已 team_task_create')
+          warnFailOpen(tool, '会话事件不可读（readEvents 无返回），无法判定本轮是否已派发成员')
           return next()
         }
         let turnStart = -1
@@ -1090,18 +1746,11 @@ export function apply(ctx, config = {}) {
           return next()
         }
         const thisTurn = events.slice(turnStart + 1)
-        let dispatchedAt = -1
-        for (let index = 0; index < thisTurn.length; index += 1) {
-          const called = thisTurn[index]?.type === 'tool/call' ? thisTurn[index]?.data?.name : undefined
-          if (DISPATCH_TOOLS.has(called)) {
-            dispatchedAt = index
-            break
-          }
-        }
-        if (dispatchedAt < 0) {
-          // 轮次令牌 = 最后一个 turn/start 的下标：同轮只提醒一次，跨轮令牌变化后重新提醒一次。
-          remindOnce(agent, `lead-evidence:${turnStart}`, leadGateReminder(tool))
-        }
+        // 派发过只影响 read / grep / glob 的校验豁免，不再是「整轮静默」的开关。
+        const dispatched = thisTurn.some((event) => event?.type === 'tool/call' && DISPATCH_TOOLS.has(event?.data?.name))
+        if (VALIDATION_TOOLS.has(tool) && dispatched) return next()
+        // 轮次令牌 = 最后一个 turn/start 的下标：同轮只提醒一次，跨轮令牌变化后重新提醒一次。
+        remindOnce(agent, `lead-evidence:${turnStart}`, leadGateReminder(caps, tool, dispatched))
         return next()
       }
       return next()
@@ -1161,7 +1810,7 @@ export function apply(ctx, config = {}) {
     warnedOverrideRead = true
     overrideWarn(`${detail}，本次模型覆盖留痕跳过（注入照常执行）。`)
   }
-  const KIND_LABEL = { member: '成员', subagent: '子代理' }
+  const KIND_LABEL = { member: '成员', subagent: '子代理', reviewer: '审查代码' }
   const kindLabel = (kind) => KIND_LABEL[kind] ?? String(kind)
 
   const observeRouteOverride = (agent, gateSession, kind, workspaceKey, route, scopedHit) => {
@@ -1211,32 +1860,50 @@ export function apply(ctx, config = {}) {
       const live = resolveConfig(liveConfig(ctx, config), configWarn)
       if (live.enabled === false) return original.call(this, spec)
       let nextSpec = spec
-      const request = spec?.request
-      if (request !== undefined) {
+      // 入参形状兼容（0.2.2-rc.2）：SubagentActivationSpec 是**扁平**的——
+      // `extends Omit<SubagentStartRequest, 'label' | 'signal'>`（宿主 packages/subagent/subagent/src/types.ts:29），
+      // parent / prompt / agentOptions 与 provider / label / delivery / signal 同在顶层，
+      // 调用点 tool-subagent/src/index.ts:317-333 也是 `{ provider, label, ...request, signal, delivery }` 展开；
+      // 生产 spec 里没有 `request` 包装键。rc.1 与本仓库旧测试用 spec.request 包装。
+      // 判据：顶层有 parent 就认顶层（宿主当前消费的形状），否则回落 request 包装；
+      // 两者都拿不到 parent 时沿用既有 fail-open：不注入、不抛。
+      const nested = spec?.request !== undefined && spec?.parent === undefined
+      const request = nested ? spec.request : spec
+      if (request !== undefined && request !== null) {
         try {
+          const parent = request.parent
           // 父会话可能是 teammate（它自己没有 /using-agent-team 记录）：与门禁分支同源，
           // 先解析 membership 拿团队 root 会话，否则 teammate 派生的子代理会漏注入。
-          const parentMembership = resolveMembership(ctx, request.parent)
-          const gateSession = parentMembership?.root?.session ?? request.parent?.session
+          const parentMembership = resolveMembership(ctx, parent)
+          const gateSession = parentMembership?.root?.session ?? parent?.session
           if (commandState(gateSession).enabled) {
             // 能力判定只认公开访问器返回的 provider 对象；拿不到（无 getProvider / undefined / 非对象）
             // 就 fail-open 不注入，也不 warn——这不是故障，只是该 provider 未注册或不可查询。
             const provider = typeof subagents.getProvider === 'function' ? subagents.getProvider(spec.provider) : undefined
             if (provider !== undefined && provider !== null && typeof provider === 'object'
               && provider.capabilities?.agentOptions === true) {
-              // 成员判定（rc.1）：只认 team/member 事件登记的 childId；childId 存在本身不是判据。
-              // rc.2 起宿主不再写 team/member，也没有「成员 / 普通子代理」的结构性区别：
-              // 开启团队的 root 直接派下的子级就是成员，teammate 再派的下级按 'subagent' 路由。
               const rosterIds = memberIds(gateSession, (error) => {
                 ctx.logger?.warn?.(`[force-subagent] 读取会话 team/member 事件失败，本次按「非成员」处理：${error instanceof Error ? error.message : String(error)}`)
               })
-              const isMember = typeof spec.childId === 'string' && (rosterIds.size > 0
-                ? rosterIds.has(spec.childId)
-                : parentMembership?.role === 'lead')
+              // 成员判定保持原语义，不得放宽成「全员 member」：
+              //  - 带 childId（rc.1 宿主写法，或 rc.2 本地 child 的预留身份 types.ts:41）：优先 team/member 名册，
+              //    名册为空才看父是不是 root；
+              //  - 不带 childId（rc.2 外部调用恒如此）：只能用 parent 的身份推断——root（Lead）直接派的子级才是
+              //    成员，teammate 再派的下级、以及身份解析不出来的父，一律走 'subagent' 路由。
+              const isMember = typeof spec.childId === 'string'
+                ? (rosterIds.size > 0 ? rosterIds.has(spec.childId) : parentMembership?.role === 'lead')
+                : parentMembership?.role === 'lead'
               // 工作区覆盖：workspaceKey 优先取工作区 path，未注册目录用 cwd 本身；拿不到则回退全局。
-              const kind = isMember ? 'member' : 'subagent'
               const workspaceKey = workspaceKeyFor(ctx, gateSession)
-              const route = resolveRoute(live, workspaceKey, kind)
+              // reviewer 是第三类路由，只在激活本身被识别为审查代码时参与判定，且优先级链是
+              // 工作区 reviewer > 全局 reviewer > 该激活本来的 member / subagent 路由。
+              // reviewer 未配置（resolveRoute 返回 undefined）时 kind 与 route 都与改动前完全一致。
+              const baseKind = isMember ? 'member' : 'subagent'
+              const reviewerRoute = isReviewerActivation(spec, request)
+                ? resolveRoute(live, workspaceKey, 'reviewer')
+                : undefined
+              const kind = reviewerRoute !== undefined ? 'reviewer' : baseKind
+              const route = reviewerRoute ?? resolveRoute(live, workspaceKey, baseKind)
               const agentOptions = {
                 ...(request.agentOptions ?? {}),
                 provider: route.provider,
@@ -1244,10 +1911,14 @@ export function apply(ctx, config = {}) {
               }
               // 显式给了 reasoningEffort 也要删：核心只在「调用方未显式给」时才清继承的推理档位。
               delete agentOptions.reasoningEffort
-              // 组装新 spec 而非就地写 request：入参 spec 保持未污染，调用方与并发观察者看到的仍是原值。
-              nextSpec = { ...spec, request: { ...request, agentOptions } }
+              // 注入落点必须是顶层 agentOptions：宿主只读顶层——manager.resolveChildAgentOptions(parent,
+              // spec.agentOptions)（packages/subagent/subagent/src/manager.ts:340），写进 request 包装等于没写。
+              // 仍组装新 spec 而非就地写：入参 spec 保持未污染，调用方与并发观察者看到的仍是原值。
+              nextSpec = { ...spec, agentOptions }
+              // rc.1 嵌套形状（spec.request 包装）保留兼容写回：包装内同步更新，宿主消费的仍是顶层。
+              if (nested) nextSpec = { ...nextSpec, request: { ...request, agentOptions } }
               // 注入已经发生（覆盖优先不变），这里只补留痕：注入模型 ≠ 会话当前模型时 warn + [team-gate] 提醒各一次。
-              observeRouteOverride(request.parent, gateSession, kind, workspaceKey, route,
+              observeRouteOverride(parent, gateSession, kind, workspaceKey, route,
                 workspaceKey !== undefined && live.workspaces?.[workspaceKey]?.[kind] !== undefined)
             }
           }
@@ -1286,12 +1957,16 @@ export function apply(ctx, config = {}) {
           const agent = context?.agent
           const session = agent?.session
           if (session === undefined || session === null) return ''
+          // 每次装配按本步 toolSet 重新探测（不冻结）：Team 开关 / preset 变化后下一步自动换档（设计 §3.4）。
+          const caps = capabilitiesFor(context)
+          const mode = modeFor() === 'flat' ? 'flat' : 'nested'
           const membership = agent === undefined ? undefined : resolveMembership(ctx, agent)
           if (membership?.role === 'teammate') {
             const rootSession = membership.root.session
-            return promptText(commandState(rootSession), modeFor() === 'flat' ? MEMBER_NUDGE_FLAT : MEMBER_NUDGE)
+            return promptText(commandState(rootSession), memberNudge(caps, mode))
           }
-          return promptText(commandState(session), modeFor() === 'flat' ? LEAD_NUDGE + FLAT_LEAD_APPENDIX : LEAD_NUDGE)
+          const nudge = leadNudge(caps)
+          return promptText(commandState(session), mode === 'flat' ? nudge + flatLeadAppendix(caps) : nudge)
         } catch (error) {
           ctx.logger?.warn?.(`[force-subagent] 读取会话事件失败，本次不注入 Agent-Team 提示：${error instanceof Error ? error.message : String(error)}`)
           return ''
@@ -1309,7 +1984,7 @@ export function apply(ctx, config = {}) {
     deliver(
       invocation?.agent,
       state.enabled && state.task !== undefined ? 'steer' : 'inject',
-      buildNotice(state),
+      buildNotice(state, latestCaps),
       (detail) => ctx.logger?.warn?.(`[force-subagent] ${detail}，命令仍返回成功。`),
     )
     return { kind: 'success', text: resultText(state) }

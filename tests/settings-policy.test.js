@@ -68,7 +68,7 @@ test('inject 不包含 settings：缺该服务时整个插件仍会 apply', () =
   const host = createHost({ withSettings: false })
   apply(host.ctx, {})
   return import('../index.js').then((plugin) => {
-    assert.deepEqual(plugin.inject, ['commands', 'systemPrompt', 'subagents'], 'inject 不得硬依赖 settings')
+    assert.deepEqual(plugin.inject, ['commands', 'systemPrompt', 'subagents', 'tools'], 'inject 不得硬依赖 settings（rc.2 只新增 tools，用于按本步 toolSet 探测工具面）')
     assert.equal(host.onCalls.includes('tools/pre-execute'), true)
   })
 })

@@ -2,9 +2,9 @@
  * dsh-force-subagent 双模式测试（Config.mode: 'nested' | 'flat'）。
  * 契约口径：
  * - 缺省 / 空串 / null → 'nested'；只有字符串 'flat' 算 flat；其它非法取值 warn 一次后按 'nested'。
- * - flat 成员提示词整段替换：含 flat 关键词与五个被禁委派工具名，不含 nested 关键句、不含字面量 team_task_create。
- * - flat Lead 提示词追加软踢出段：逐条成员消息先判定完成，完成即 interrupt_agent + team_task_update，之后不再 send_message / 不复用；并写明宿主没有删除成员的 API。
- * - flat 门禁（task-22 软门禁口径）：成员调 subagent / subagent_fork / subagent_role / close_subagent / workflow 放行 + 提醒一次（next 恰好一次）；成员调 write / edit / bash 放行且不提醒。
+ * - flat 成员提示词整段替换：含 flat 关键词与 rc.2 三个被劝阻委派工具名，不含 nested 关键句、不含字面量 team_task_create，也不点名 rc.2 已删除的 subagent_role / close_subagent。
+ * - flat Lead 提示词追加软踢出段：逐条成员消息先判定完成，完成即 interrupt_agent 收敛，之后不再 send_message / 不复用；并写明宿主没有删除成员的 API（team_task_update 不在注入文案里）。
+ * - flat 门禁（task-22 软门禁口径）：成员调 subagent / subagent_fork / workflow 放行 + 提醒一次（next 恰好一次）；rc.1 已删除的委派工具不提醒；成员调 write / edit / bash 放行且不提醒。
  * - nested 门禁口径不回归：成员调 subagent 放行不提醒、调 bash 放行但提醒一次。
  * 脚手架沿用 tests/member-gate-deny.test.js（真实监听器 + next 计数）与 tests/force-subagent.test.js（section 捕获）。
  * 运行：node --test tests/mode-flat.test.js
@@ -20,8 +20,24 @@ const GATE_EVENT = 'tools/pre-execute'
 const COMMAND_NAME = 'using-agent-team'
 const ENTRY_ID = 'dsh-force-subagent'
 
-/** flat 下成员被禁止的委派工具（与 index.js 的 DELEGATION_TOOLS 同一份口径）。 */
-const DELEGATION_TOOLS = ['subagent', 'subagent_fork', 'subagent_role', 'close_subagent', 'workflow']
+/** flat 下成员被劝阻的委派工具（与 index.js 的 DELEGATION_TOOLS 同一份口径：只列 rc.2 真实存在的入口）。 */
+const DELEGATION_TOOLS = ['subagent', 'subagent_fork', 'workflow']
+/** rc.1 存在、rc.2 已不复存在的委派工具：门禁不得再为它们提醒，文案也不得点名。 */
+const RC1_REMOVED_TOOLS = ['subagent_role', 'close_subagent']
+
+/**
+ * rc.2 宿主的真实工具面：section 的 text(context) 与门禁的 exec 都带本步 toolSet，
+ * index.js 据此探测 caps（team 档 = 有 team_task_create / interrupt_agent）。
+ * 不注入 tools 的话 rc.2 契约会走 standard 降级文案并 warn 一次，旧断言就测不到 team 档。
+ */
+const TOOL_SET = Object.freeze({ step: 'test' })
+const TEAM_TOOL_NAMES = [
+  ...DELEGATION_TOOLS,
+  'team_task_create', 'team_task_update', 'team_task_list', 'interrupt_agent',
+  'send_message', 'list_agents', 'wait_agent', 'todo_write',
+  'read', 'grep', 'glob', 'write', 'edit', 'bash',
+]
+const createTools = () => ({ definitions: () => TEAM_TOOL_NAMES.map((name) => ({ name })) })
 
 function createSystemPrompt() {
   const sections = []
@@ -33,7 +49,7 @@ function createCommands() {
   return { registered, register: (definition) => { registered.push(definition) } }
 }
 
-function createHost({ agentTeams, settings } = {}) {
+function createHost({ agentTeams, settings, tools } = {}) {
   const systemPrompt = createSystemPrompt()
   const commands = createCommands()
   const warnings = []
@@ -44,8 +60,9 @@ function createHost({ agentTeams, settings } = {}) {
       service === 'systemPrompt' ? systemPrompt
         : service === 'commands' ? commands
           : service === 'agentTeams' ? agentTeams
-            : service === 'settings' ? settings
-              : undefined
+            : service === 'tools' ? (tools ?? createTools())
+              : service === 'settings' ? settings
+                : undefined
     ),
     on: (...args) => { onCalls.push(args) },
     effect: (factory) => factory(),
@@ -80,13 +97,14 @@ function sectionOf(host) {
   return host.systemPrompt.sections[0]
 }
 
-const sectionText = (host, agent) => sectionOf(host).text({ agent })
+const sectionText = (host, agent) => sectionOf(host).text({ agent, toolSet: TOOL_SET })
 
 const execOf = (name, agent) => ({
   callId: `call-${name}`,
   name,
   arguments: {},
   agent,
+  toolSet: TOOL_SET,
   signal: new AbortController().signal,
 })
 
@@ -147,7 +165,10 @@ test('B) mode=flat：成员提示词整段换成 flat 版，nested 关键句与 
   assert.match(text, /你自己执行/, 'flat 成员提示词必须写明成员自己执行')
   assert.match(text, /只用成员、不派子代理/, 'flat 成员提示词必须声明本团队不派子代理')
   for (const tool of DELEGATION_TOOLS) {
-    assert.ok(text.includes(tool), `flat 成员提示词必须点名被门禁拒绝的「${tool}」`)
+    assert.ok(text.includes(tool), `flat 成员提示词必须点名被门禁劝阻的「${tool}」`)
+  }
+  for (const tool of RC1_REMOVED_TOOLS) {
+    assert.ok(!text.includes(tool), `flat 成员提示词不得点名 rc.2 已删除的「${tool}」`)
   }
   assert.doesNotMatch(text, /第一个业务工具调用必须是委派/, 'flat 成员提示词不得保留 nested 委派关键句')
   assert.doesNotMatch(text, /必须委派|你只是编排者/, 'flat 成员提示词不得保留 nested 编排者措辞')
@@ -156,17 +177,15 @@ test('B) mode=flat：成员提示词整段换成 flat 版，nested 关键句与 
   assert.doesNotMatch(text, /深度≤2/, 'flat 模式没有下派层级，不得保留深度要求')
 })
 
-test('B2) mode=flat：Lead 提示词追加软踢出段（判定完成 → interrupt_agent + team_task_update → 不再 send_message）', () => {
+test('B2) mode=flat：Lead 提示词追加软踢出段（判定完成 → interrupt_agent 收敛 → 不再 send_message）', () => {
   const host = memberHost()
   apply(host.ctx, { mode: 'flat' })
   const text = sectionText(host, leadAgent('on'))
   assert.match(text, /team_task_create/, 'flat 的 Lead 仍要建看板，nested 段不得被替换掉')
   assert.match(text, /判定该成员本次任务是否完成/, 'Lead 必须逐条成员消息先判定完成')
-  assert.match(text, /interrupt_agent/, '完成必须 interrupt_agent 中断该成员')
-  assert.match(text, /team_task_update/, '完成必须 team_task_update 关闭任务')
-  assert.match(text, /不再向该成员 send_message|不再 send_message/, '完成后不得再 send_message / 复用')
+  assert.match(text, /interrupt_agent/, '完成必须 interrupt_agent 中断该成员当前 turn')
+  assert.match(text, /不再向它 send_message|不再向该成员 send_message/, '完成后不得再 send_message / 复用')
   assert.match(text, /没有删除成员的 API/, '必须写明宿主没有删除成员 API')
-  assert.match(text, /软踢出/, '必须写明这是软踢出而不是删除')
 })
 
 test('C) 实时配置优先：settings.describe() 的 mode 覆盖 apply 时的快照（改设置不必重启插件）', async () => {
@@ -187,7 +206,7 @@ test('C) 实时配置优先：settings.describe() 的 mode 覆盖 apply 时的�
   assert.match(agent.notices[0]?.content?.[0]?.text ?? '', /flat 模式/, '提醒必须点明 flat 模式')
 })
 
-test('D) flat 门禁：成员调五个委派工具一律放行 + 提醒一次（文案点明 flat 模式与自己执行）', async () => {
+test('D) flat 门禁：成员调 rc.2 三个委派入口一律放行 + 提醒一次（文案点明 flat 模式与自己执行）', async () => {
   for (const tool of DELEGATION_TOOLS) {
     const host = memberHost()
     apply(host.ctx, { mode: 'flat' })
@@ -201,6 +220,17 @@ test('D) flat 门禁：成员调五个委派工具一律放行 + 提醒一次（
     assert.match(text, /flat 模式/, `${tool}：提醒文案必须点明 flat 模式`)
     assert.match(text, /自己执行/, `${tool}：提醒文案必须要求成员自己执行`)
     assert.match(text, new RegExp(`「${tool}」`), `${tool}：提醒文案必须点名被劝阻的工具`)
+  }
+  // rc.1 已删除的委派工具不在 rc.2 工具面里：门禁不得为不存在的工具凭空提醒，工具本身照常放行。
+  for (const tool of RC1_REMOVED_TOOLS) {
+    const host = memberHost()
+    apply(host.ctx, { mode: 'flat' })
+    const agent = teammateAgent('on')
+    const { decisions, threw, nextCalls } = await gateOutcome(host, execOf(tool, agent))
+    assert.equal(threw, undefined, `${tool}：rc.1 旧工具不得抛异常，实际：${threw instanceof Error ? threw.message : String(threw)}`)
+    assert.equal(decisions.filter((decision) => decision?.kind === 'deny').length, 0, `${tool}：未知工具不得 deny，实际 decisions=${JSON.stringify(decisions)}`)
+    assert.equal(nextCalls, 1, `${tool}：放行路径必须恰好调用 next 一次，实际 ${nextCalls} 次`)
+    assert.equal(agent.notices.length, 0, `${tool}：rc.2 已删除的工具不得触发 flat 委派提醒，实际 ${agent.notices.length} 条`)
   }
 })
 

@@ -12,21 +12,26 @@
  *      packages/experimental/tool-terminal/src/index.ts:166 / :203 / :307 / :340；terminal_close / terminal_list
  *      是终端生命周期簿记、不在集合内，理由见 index.js 注释）；
  *   Lead 提醒触发集合 = 三类并集（取证 8 + 实现 4 + 执行 5 = 17），同一判据；
- *   提醒条件 = Lead 会话（ctx.get('agentTeams').tryMembership(exec.agent) 未命中）
+ *   判据（rc.2 新口径，设计 §3.1/§3.2）= 工具名不在编排动作集合内（isOrchestrationTool 之外一律命中，
+ *     含 mcp__* / office_* 等未枚举工具）
+ *     + Lead 会话（ctx.get('agentTeams').tryMembership(exec.agent) 未命中）
  *     + force-subagent 启用（Lead 会话最后一次 command/run（using-agent-team）args 非 off）
- *     + 被调工具 ∈ 三类并集
- *     + 本 turn（事件序列中最后一个 turn/start 之后）没有委派类 tool/call（subagent / subagent 系列 / workflow）
  *     → 经 agent.inject 投递一条 [team-gate] 提醒，随后 return next() 放行；插件不返回任何拒绝结果。
+ *   **删除「本轮派发过就整轮静默」**：本轮已派发不再是豁免开关——
+ *     仅 read / grep / glob 在本轮已派发后视为「校验产物」豁免；write / edit / bash / run_code / mcp__* 等
+ *     派发后仍提醒（文案换成「派发不等于放手」分支）。子代理（header.delegationDepth>=1）仍不提醒。
  *   去重粒度 = 轮次：提醒 key = lead-evidence:${最后一个 turn/start 的下标}，同轮只提醒一次，
  *     新的 turn/start 到来（Lead 收到新消息）后重新提醒一次；
  *   会话是否还有 running 成员、本轮是否 interrupt_agent 过成员都不参与判定（hasRunningMember 与 interrupt_agent 判据已移除）；
- *   编排类工具（team_task_* / subagent / send_message / wait_agent / list_agents / interrupt_agent）不受影响；
+ *   编排类工具（rc.2 真实存在的委派 / 调度 / 看板 / 提问工具）不受影响；rc.1 的 spawn_teammate 已不是编排动作，按普通工具提醒；
  *   单靠 team_task_create 不算已派发（仍提醒一次）；
  *   其余全部放行（返回值必须是 next() 的结果）；成员会话（tryMembership 命中）继续走既有成员门禁分支；
  *   fail-open：读取会话事件（snapshotEvents）抛错 → 放行、不提醒、不抛异常。
  * 断言口径：每条用例都核对 next 是否被调用与调用次数；提醒用例核对恰好一条提醒
  *   （点名工具名与 team_task_create / subagent 出路）+ next 恰好一次 + 无 deny；放行用例核对
  *   next 恰好一次、返回值来自 next() 且不投递提醒。
+ * 能力按本步工具面探测：夹具显式提供 tools.definitions(scope, toolSet) 并让 exec 带 toolSet，统一探测成 team 档，
+ *   避免走「探测失败 → standard 安全默认」的告警路径。
  * 构造方式与 tests/member-gate-deny.test.js、tests/member-gate-allow.test.js、tests/gate-observability.test.js 一致：
  *   真实 apply(ctx) 登记的 tools/pre-execute 处理器，不 mock 处理器自身。
  * 运行：node --test tests/lead-gate.test.js
@@ -59,6 +64,15 @@ const IMPLEMENTATION_TOOLS = ['write', 'edit', 'apply_patch', 'str_replace_edito
  */
 const EXECUTION_TOOLS = ['run_code', 'terminal_open', 'terminal_read', 'terminal_send', 'terminal_signal']
 
+/** 本文件统一探测成 team 档：team_task_create 可见（看板流程）+ 全套委派工具，提醒里的「team_task_create → subagent」出路依赖它。 */
+const TEAM_TOOL_NAMES = [
+  'team_task_create', 'team_task_list', 'team_task_claim', 'team_task_update',
+  'subagent', 'subagent_fork', 'workflow', 'send_message', 'list_agents', 'wait_agent', 'todo_write',
+  'bash', 'read', 'grep', 'glob', 'write', 'edit', 'run_code', 'web_fetch', 'web_search', 'read_image', 'pwsh',
+]
+/** 本步 toolSet 的替身：capabilitiesFor 按它做探测缓存，必须是稳定对象。 */
+const TOOL_SET = { id: 'test-tool-set' }
+
 /** 真实 ctx 的最小形状：与既有门禁测试同一套 createHost。 */
 function createHost({ agentTeams } = {}) {
   const onCalls = []
@@ -67,6 +81,7 @@ function createHost({ agentTeams } = {}) {
     systemPrompt: { section: () => {} },
     commands: { register: () => {} },
     agentTeams,
+    tools: { definitions: () => TEAM_TOOL_NAMES.map((name) => ({ name })) },
   }
   const ctx = {
     logger: { warn: (message) => warnings.push(message) },
@@ -132,6 +147,7 @@ const execOf = (name, agent) => ({
   name,
   arguments: {},
   agent,
+  toolSet: TOOL_SET,
   signal: new AbortController().signal,
 })
 
@@ -239,6 +255,12 @@ async function assertReminded(t, host, tool, agent, label, hint = /team_task_cre
   assert.match(text, hint, `${label} / ${tool}：提醒必须命中「${hint}」，实际为「${text}」`)
 }
 
+/** 已派发态提醒判据（rc.2 删除「整轮静默」）：实现 / 执行 / 取证类在已派发后仍提醒一次，文案走「派发不等于放手」分支。 */
+async function assertRemindedAfterDispatch(t, host, tool, agent, label) {
+  await assertReminded(t, host, tool, agent, label, /本轮已派发成员，但你仍在亲自执行/)
+  return agent?.notices?.[0]?.content?.[0]?.text
+}
+
 test(`契约：apply 注册 ${GATE_EVENT} 处理器（Lead 门禁断言的前提）`, (t) => {
   const host = leadHost()
   apply(host.ctx)
@@ -294,7 +316,9 @@ test('L4 force-subagent 未启用：bash 放行（next 恰好 1 次）', async (
 
 test('L5 编排类工具不受 Lead 门禁影响：一律放行（next 恰好 1 次）', async (t) => {
   const ORCHESTRATION = [
-    'spawn_teammate',
+    'subagent',
+    'subagent_fork',
+    'workflow',
     'team_task_create',
     'team_task_get',
     'team_task_list',
@@ -303,6 +327,12 @@ test('L5 编排类工具不受 Lead 门禁影响：一律放行（next 恰好 1 
     'list_agents',
     'wait_agent',
     'interrupt_agent',
+    'todo_write',
+    'ask_user_question',
+    'skill',
+    'job_list',
+    'job_output',
+    'job_kill',
   ]
   for (const tool of ORCHESTRATION) {
     await t.test(tool, async () => {
@@ -312,6 +342,12 @@ test('L5 编排类工具不受 Lead 门禁影响：一律放行（next 恰好 1 
       await assertAllowed(t, host, tool, agent, `L5 编排类工具（${tool}）`)
     })
   }
+  // 新口径：rc.1 的 spawn_teammate 在 rc.2 已不存在、也不在编排集合内 → 按普通工具命中提醒。
+  await t.test('spawn_teammate（rc.1 旧名）已不是编排动作 → 提醒一次', async () => {
+    const host = leadHost()
+    apply(host.ctx)
+    await assertReminded(t, host, 'spawn_teammate', leadAgent([runEvent('on'), turnStart(1)]), 'L5 rc.1 旧名', /team_task_create[\s\S]*subagent/)
+  })
 })
 
 test('L6 成员会话（tryMembership 命中）仍走既有成员门禁分支：白名单外提醒、白名单内放行', async (t) => {
@@ -442,21 +478,29 @@ test('L11 本轮没有派发：取证工具逐个放行 + 提醒一次（含 web
   }
 })
 
-test('L12 本轮已 subagent：Lead 取证放行且不提醒（判据只看本轮是否已派发）', async (t) => {
+test('L12 本轮已 subagent：bash 仍提醒一次（已派发不构成整轮静默），只有 read / grep / glob 走校验豁免', async (t) => {
   const host = leadHost()
   apply(host.ctx)
-  const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('team_task_create'), toolCall('spawn_teammate'), memberEvent('m1')])
-  await assertAllowed(t, host, 'bash', agent, 'L12 本轮已派发且有 running 成员')
+  const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('team_task_create'), toolCall('subagent'), memberEvent('m1')])
+  await assertRemindedAfterDispatch(t, host, 'bash', agent, 'L12 本轮已派发 / bash')
+  // 校验类工具在已派发后仍豁免：放行且不新增提醒（同轮条数维持 1）。
+  for (const tool of ['read', 'grep', 'glob']) {
+    const { decisions, threw, nextCalls } = await gateOutcome(host, execOf(tool, agent))
+    assert.equal(threw, undefined, `L12 / ${tool}：门禁处理器不得抛异常`)
+    assert.equal(decisions.filter((decision) => decision?.kind === 'deny').length, 0, `L12 / ${tool}：不得 deny，实际 ${stringify(decisions)}`)
+    assert.equal(nextCalls, 1, `L12 / ${tool}：必须放行（next 恰好一次），实际 ${nextCalls} 次`)
+  }
+  assert.equal(agent.notices.length, 1, `L12：已派发后校验类工具不得刷新提醒，实际 ${agent.notices.length} 条`)
 })
 
-test('L13 interrupt_agent 不参与判定：本轮已派发后中断成员再取证，放行且不提醒', async (t) => {
+test('L13 interrupt_agent 不参与判定：本轮已派发后中断成员，grep 走校验豁免（放行）；无派发对照仍提醒一次', async (t) => {
   const host = leadHost()
   apply(host.ctx)
   const agent = leadAgent([
     runEvent('on'),
     turnStart(1),
     toolCall('team_task_create'),
-    toolCall('spawn_teammate'),
+    toolCall('subagent'),
     memberEvent('m1'),
     taskEvent('t1', 'in_progress', 'm1'),
     toolCall('interrupt_agent'),
@@ -477,22 +521,22 @@ test('L13 interrupt_agent 不参与判定：本轮已派发后中断成员再取
   assert.equal(bareAgent.notices.length, 1, `L13 无派发对照：必须恰好投递一条提醒，实际 ${bareAgent.notices.length} 条`)
 })
 
-test('L14 中断成员后重新 spawn 派发：同一轮立即恢复放行（不得永久锁死）', async (t) => {
+test('L14 中断成员后重新派发：同一轮立即恢复「已派发」态（bash 仍按已派发文案提醒一次，不再整轮静默）', async (t) => {
   const host = leadHost()
   apply(host.ctx)
   const agent = leadAgent([
     runEvent('on'),
     turnStart(1),
-    toolCall('spawn_teammate'),
+    toolCall('subagent'),
     memberEvent('m1'),
     toolCall('interrupt_agent'),
     toolCall('team_task_create'),
-    toolCall('spawn_teammate'),
+    toolCall('subagent'),
   ])
-  await assertAllowed(t, host, 'bash', agent, 'L14 中断后重新派发')
+  await assertRemindedAfterDispatch(t, host, 'bash', agent, 'L14 中断后重新派发')
 })
 
-test('L15 running 成员判据已移除：成员 active / failed / 任务全部 completed 都不参与判定（本轮未派发一律提醒一次，本轮已派发一律不提醒）', async (t) => {
+test('L15 running 成员判据已移除：成员 active / failed / 任务全部 completed 都不参与判定（本轮未派发一律提醒一次；已派发后 read 走校验豁免）', async (t) => {
   const CASES = [
     {
       label: '上一 turn spawn 的 active 成员仍有 in_progress 任务',
@@ -516,18 +560,18 @@ test('L15 running 成员判据已移除：成员 active / failed / 任务全部 
     await t.test(`${label}（本轮已派发）`, async () => {
       const host = leadHost()
       apply(host.ctx)
-      await assertAllowed(t, host, 'read', leadAgent([...events, toolCall('spawn_teammate')]), `L15 ${label} 已派发`)
+      await assertAllowed(t, host, 'read', leadAgent([...events, toolCall('subagent')]), `L15 ${label} 已派发`)
     })
   }
 })
 
-test('L16 nested 模式 Lead 直派 subagent / workflow 也算已派发：取证放行', async (t) => {
+test('L16 nested 模式 Lead 直派 subagent / subagent_fork / workflow 被识别为已派发：bash 仍按已派发文案提醒一次（校验类才豁免）', async (t) => {
   for (const dispatch of ['subagent', 'subagent_fork', 'workflow']) {
     await t.test(dispatch, async () => {
       const host = leadHost()
       apply(host.ctx)
       const agent = leadAgent([runEvent('on'), turnStart(1), toolCall(dispatch)])
-      await assertAllowed(t, host, 'bash', agent, `L16 本轮已派发 ${dispatch}`)
+      await assertRemindedAfterDispatch(t, host, 'bash', agent, `L16 本轮已派发 ${dispatch}`)
     })
   }
 })
@@ -544,7 +588,7 @@ test('L17 本轮没有派发：实现工具逐个放行 + 提醒一次（write /
   }
 })
 
-test('L18 实现工具的提醒正文：前缀 [team-gate] 提醒、点名「实现工具「write」」与「实现与取证都必须委派」，工具照常执行', async (t) => {
+test('L18 实现工具的提醒正文：前缀 [team-gate] 提醒、点名「实现工具「write」」与「Lead 只做拆分、派发、合并与校验」，工具照常执行', async (t) => {
   const host = leadHost()
   apply(host.ctx)
   const agent = leadAgent([runEvent('on'), turnStart(1)])
@@ -558,17 +602,18 @@ test('L18 实现工具的提醒正文：前缀 [team-gate] 提醒、点名「实
   assert.match(text, /本轮还没有派发成员/, `L18 / write：必须说明本轮尚未派发，实际「${text}」`)
   assert.match(text, /实现工具「write」/, `L18 / write：必须把它归为实现工具并点名工具名，实际「${text}」`)
   assert.match(text, /仍会照常执行/, `L18 / write：必须说明工具照常执行，实际「${text}」`)
-  assert.match(text, /实现与取证都必须委派/, `L18 / write：必须说明实现与取证都必须委派，实际「${text}」`)
+  assert.match(text, /Lead 只做拆分、派发、合并与校验/, `L18 / write：必须说明 Lead 只做拆分、派发、合并与校验，实际「${text}」`)
   assert.match(text, /team_task_create[\s\S]*subagent/, `L18 / write：必须给出正确做法，实际「${text}」`)
   assert.match(text, /新的 turn 开始后会再提醒一次/, `L18 / write：必须说明按轮刷新，实际「${text}」`)
   assert.deepEqual(host.warnings, [], `L18 / write：提醒投递不属于 fail-open，不得 warn，实际：${JSON.stringify(host.warnings)}`)
 })
 
-test('L19 本轮已 subagent：Lead 的 write 放行且不提醒（门禁判「本轮是否已派出活」，不是一律封写）', async (t) => {
+test('L19 本轮已 subagent：Lead 的 write 仍放行但提醒一次（已派发不是整轮豁免，派发不等于放手）', async (t) => {
   const host = leadHost()
   apply(host.ctx)
-  const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('team_task_create'), toolCall('spawn_teammate'), memberEvent('m1')])
-  await assertAllowed(t, host, 'write', agent, 'L19 本轮已派发')
+  const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('team_task_create'), toolCall('subagent'), memberEvent('m1')])
+  const text = (await assertRemindedAfterDispatch(t, host, 'write', agent, 'L19 本轮已派发'))
+  assert.match(text, /实现工具「write」/, 'L19：已派发文案同样必须归类为实现工具并点名 write')
 })
 
 test('L20 Lead 派出的子代理（header.delegationDepth=1）实现工具放行：委派后的实现必须真能落地', async (t) => {
@@ -616,20 +661,21 @@ test('L23 执行类工具的提醒正文：前缀 [team-gate] 提醒、逐个点
       assert.equal(agent.notices.length, 1, `L23 / ${tool}：必须恰好投递一条提醒，实际 ${agent.notices.length} 条`)
       const text = agent.notices[0]?.content?.[0]?.text
       assert.match(text, new RegExp(`^\\[team-gate\\] 提醒：本轮还没有派发成员，执行工具「${tool}」`), `L23 / ${tool}：必须归类为「执行工具」并点名工具名，实际「${text}」`)
-      assert.match(text, /执行工具本身就是取证与实现的等价通道/, `L23 / ${tool}：必须说明它是取证与实现的等价通道，实际「${text}」`)
+      assert.match(text, /仍会照常执行/, `L23 / ${tool}：必须说明工具照常执行（软门禁只提醒不拦），实际「${text}」`)
       assert.match(text, /team_task_create[\s\S]*subagent/, `L23 / ${tool}：必须给出正确做法，实际「${text}」`)
       assert.deepEqual(host.warnings, [], `L23 / ${tool}：提醒投递不属于 fail-open，不得 warn，实际：${JSON.stringify(host.warnings)}`)
     })
   }
 })
 
-test('L24 本轮已 subagent：Lead 的执行类工具放行且不提醒（门禁判「本轮是否已派出活」，不是一律提醒执行）', async (t) => {
+test('L24 本轮已 subagent：Lead 的执行类工具仍放行但各提醒一次（已派发不是整轮豁免）', async (t) => {
   for (const tool of EXECUTION_TOOLS) {
     await t.test(tool, async () => {
       const host = leadHost()
       apply(host.ctx)
-      const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('team_task_create'), toolCall('spawn_teammate'), memberEvent('m1')])
-      await assertAllowed(t, host, tool, agent, `L24 本轮已派发（${tool}）`)
+      const agent = leadAgent([runEvent('on'), turnStart(1), toolCall('team_task_create'), toolCall('subagent'), memberEvent('m1')])
+      const text = await assertRemindedAfterDispatch(t, host, tool, agent, `L24 本轮已派发（${tool}）`)
+      assert.match(text, /执行工具/, `L24 / ${tool}：已派发文案同样必须归类为执行工具`)
     })
   }
 })

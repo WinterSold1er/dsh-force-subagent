@@ -9,7 +9,7 @@
 | 触发 | `agentTeams` 自动按角色（`lead` / `teammate`） | 会话内执行 `/using-agent-team` 后开启，`off` 关闭 |
 | 注入点 | `agent/pre-step` waterfall 追加 user 消息（每批新消息一次） | 全局 `systemPrompt.section`，名 `force-subagent:agent-team`，order 57，每轮 assemble 求值 |
 | 状态 | 不落盘，依赖每个消息批次 | 不落盘，门控派生自宿主 `command/run` 事件（`data.name === 'using-agent-team'`；`args === 'off'` 关闭，裸命令 / `on` / `<task>` 开启） |
-| 依赖 | `inject = ['agentTeams']` | `inject = ['commands', 'systemPrompt', 'subagents']`；`subagents` 为 DSH 核心服务（子代理模型路由注入包裹 `startActivation` 的前提），缺失时 Cordis 注入门控使插件不进入 ACTIVE；`ctx.get` 快照为空时 `ctx.logger.warn` 点名缺失服务并停用 |
+| 依赖 | `inject = ['agentTeams']` | `inject = ['commands', 'systemPrompt', 'subagents', 'tools']`；`subagents` 为 DSH 核心服务（子代理模型路由注入包裹 `startActivation` 的前提），缺失时 Cordis 注入门控使插件不进入 ACTIVE；`tools` 是能力探测的软依赖：缺失时按探测失败降级（standard 档文案 + 每次 apply 一条 warn），不阻塞 apply；`ctx.get` 快照为空时 `ctx.logger.warn` 点名缺失服务并停用 |
 | 文案 | `lead` / `teammate` 两套 | 单套强制委派提醒 |
 | 命令冲突 | 无此逻辑 | `commands.register` 抛 "already registered" 时 warn 点名旧版 `dsh-plugin-subagent-director`，只跳过命令注册，section 照常工作；其他错误原样抛出 |
 
@@ -36,7 +36,7 @@
 - **单次命令触发不会双注入**：宿主对命令只记录 `command/run` 事件，不写 user 消息；本插件只注册一个 section、不追加消息，因此一次触发只产生一份提示。
 - **已知双 section**：同一会话先执行 `/using-agent-team`、再用自然语言触发 director，可能同时出现 `force-subagent:agent-team`/57 与 `orchestrate-mode`/55 两段提醒。这是已知行为，不做代码绕过；要避免就固定用一种入口，或先 `off` 再用另一种。另一处来源是升级顺序错误（旧 director 未升级即重启），见[生效步骤](#生效步骤)的必做顺序。
 - **提示词级提醒，不是工具级强制**：插件只往 system prompt 写文本，不拦截调用、不改变工具可用性；模型是否照做仍取决于提示词约束。
-- **服务依赖**：需要 `commands` 与 `systemPrompt`（`inject` 声明）。任一缺失时 Cordis 不调用 `apply`；`ctx.get` 返回空（isolate 场景）时插件 `ctx.logger.warn` 点名缺失服务并返回，插件停用、不静默生效。
+- **服务依赖**：需要 `commands`、`systemPrompt` 与 `subagents`（`inject` 声明）；`tools` 为能力探测的软依赖，缺失时按探测失败降级（standard 档文案 + 每次 apply 一条 warn），不阻塞 apply。任一硬依赖缺失时 Cordis 不调用 `apply`；`ctx.get` 返回空（isolate 场景）时插件 `ctx.logger.warn` 点名缺失服务并返回，插件停用、不静默生效。
 
 ## 已知测试缺口（client.js UI，2026-11-05 冻结版）
 
@@ -46,3 +46,22 @@
 - `bindSession` 无观测；入口测试只断言 `layout.selectPanel(PANEL_ID)`，测试标题不声称“绑定会话”。
 - `routableProviders` 过滤不适用为既定行为（宿主 `groups` 已过滤空模型，`routableProviders` 由 `groups` 派生），行为测试显式钉住该行为，不作为期望特性。
 
+
+## 追加变更（2026-11-18）：审查代码模型（`reviewer` 路由）与内置 skills 收编
+
+| 维度 | 旧行为 | 新行为 |
+| :--- | :--- | :--- |
+| 模型路由条数 | 两条：`member` / `subagent`（必填、有默认值） | 三条：新增**可选** `reviewer`——全局 `Config.reviewer` 与每个 `workspaces[key].reviewer`。`optionalRouteSchema` 两段默认空串，`DEFAULT_CONFIG` 不含该键；provider 与 model 必须同时非空，只配一半整条忽略并 warn 一次（按配置位置去重），绝不注入残缺路由 |
+| 审查员用哪个模型 | 与实现成员 / 子代理共用 `member` / `subagent` 路由 | 被 `isReviewerActivation` 识别为审查代码的激活先取 `reviewer`：工作区 `reviewer` → 全局 `reviewer` → 该激活原本的 `member` / `subagent`。识别只看 `spec.name`（非空时只认名字，`reviewer` / `reviewer-1` / `code-reviewer` / `adversarial-reviewer` / `review` / `code-review` 这一类）→ `request.agentPreset` → `label`，`description` 从不参与判定 |
+| 向后兼容 | — | 未配置 `reviewer` 时 `resolveRoute` 返回 `undefined`，`kind` 与注入路由与改动前完全一致；`enabled: false` 时 `reviewer` 同样完全不生效。注入语义不变：写顶层 `agentOptions`、无条件删 `reasoningEffort`、rc.1 嵌套形状同步写回、入参 `spec` 不被就地修改；覆盖留痕的 `kind` 显示「审查代码」 |
+| 设置页 | 两张路由卡（成员模型 / 子代理模型） | 三张卡，新增「审查代码模型」（`#fsx-reviewerProvider` / `#fsx-reviewerModel`），留空提示「留空则回退到成员 / 子代理路由」。卡片、校验与禁用提示共用 `ROUTE_GROUPS`；任一组 provider 与 model 不成对时「保存设置」与「保存设置到所有工作区」都禁用，并在可见文案里点名是哪张卡 |
+| 4 个 team skills 的来源 | 手工放在 `~/.dsh/skills` | 随包分发（`package.json` 的 `files` 已含 `skills`）并由插件向宿主 `skills` 服务 `registerProvider` 自动注册：`rank = 550`、`source = 'custom'`、`provider = 'dsh-force-subagent'`，从本包 `skills/<name>/SKILL.md` 按需只读加载；服务缺失安静降级；卸载随 scope 注销 |
+| 技能正文口径 | 引用 rc.1 的 `spawn_teammate` 等工具名 | 已按 DSH 0.2.2-rc.2 真实工具面收编：成员用 `subagent` / `subagent_fork` 拉起，看板用 `todo_write`，模型与思考强度由插件路由配置决定而非派发参数，审查员成员命名 `reviewer` 以命中「审查代码模型」 |
+
+**生效**：改宿主侧 `index.js` 需重启 dsh web host；只改 `client.js` 由 client-hmr 自动重建。配置 `reviewer` 两条路：profile 的 `cordis.patch.yml` 里加 `reviewer:` 块（全局），或设置页第三张卡（只写 `workspaces[key].reviewer`，保存载荷始终只有 `enabled` / `workspaces` / `mode` 三个 `set` op，设置页不会写全局 `reviewer`）。改完由 HMR 触发 dispose + 重新 apply，无需重启。内置 skills 随插件加载自动注册，安装接线步骤不变、无需手工拷贝技能。
+
+**注意（层口径，不是纯 rank）**：宿主 skill registry 的契约是「跨层由最近的一层直接胜出，`rank` 只在同一层内决定重名」（`packages/skill/skill/src/index.ts` 的 `collectFresh`）。条件式结论（不是无条件事实）：若本插件 provider 与 `~/.dsh/skills`（`user-dsh` 根）同在 global 层，同层比 rank 则 400 胜出——`~/.dsh/skills` 里若还留着同名旧拷贝，命中的是它，随包版本不会生效；需手工删除或更新 `~/.dsh/skills/<name>`，插件不会替你删。当前实际状态（2026-11-18 14:05 起）：`~/.dsh/skills/team-*` 四份旧拷贝已迁移到 `~/.dsh/backups/skills-team-20261118-140511/`，`~/.dsh/skills` 已无同名条目，所以现在命中的是随包 provider（550）；把旧拷贝放回 `~/.dsh/skills` 才会按 rank 400 胜出。若插件 provider 落在更近的层，同名会由本插件胜出，与 550 / 400 的大小无关。详见 [docs/install.md](install.md) 的《内置 skills》一节与那里的自检命令（含「确认命中来源：比对 `list()` 结果的 `source` / `path`」这一步）。
+
+**回滚**：删掉 patch 里的 `reviewer` 配置块，或在设置页把第三张卡留空保存，即回到改动前的行为（`resolveConfig` 不挂该字段，`resolveConfig({})` 仍与 `DEFAULT_CONFIG` 深相等）。内置 skills 要撤掉只能卸载插件或让宿主不加载 `skills` 服务；它们不参与门禁、委派提示与路由注入，撤掉不影响这三项主功能。
+
+**边界**：`reviewer` 只影响注入哪条模型路由，不改变成员身份判定、门禁、软踢出与提示文案；识别只认名字 / preset / label 三段，实现类任务的 label 不算命中。内置 skills 是增值能力：`skills` 服务缺失时不出现、不 warn，门禁与提示照旧。

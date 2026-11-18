@@ -208,9 +208,13 @@ test('W5 readEvents 抛错：fail-open 放行且 warn 恰好一次', async (t) =
   }
   await assertAllowed(t, host, 'wait_agent', agent, 'W5 读事件抛错')
   await assertAllowed(t, host, 'wait_agent', agent, 'W5 读事件抛错（第二次）')
-  assert.equal(host.warnings.length, 1, `warn 必须恰好一次，实际 ${host.warnings.length}：${host.warnings.join(' | ')}`)
-  assert.match(host.warnings[0], /wait_agent/, `warn 必须点名 wait_agent，实际为「${host.warnings[0]}」`)
-  assert.match(host.warnings[0], /snapshot boom/, `warn 必须带原始错误信息，实际为「${host.warnings[0]}」`)
+  // 新契约：门禁与「工具面探测降级」是两条独立 warn-once 通道，必须分别断言（探测 warn 不能吞掉 fail-open warn）。
+  const probeWarnings = host.warnings.filter((message) => /工具面探测降级/.test(message))
+  const gateWarnings = host.warnings.filter((message) => !/工具面探测降级/.test(message))
+  assert.equal(probeWarnings.length, 1, `探测降级同样必须恰好一次，实际 ${probeWarnings.length}：${host.warnings.join(' | ')}`)
+  assert.equal(gateWarnings.length, 1, `门禁 warn 必须恰好一次，实际 ${gateWarnings.length}：${host.warnings.join(' | ')}`)
+  assert.match(gateWarnings[0], /wait_agent/, `warn 必须点名 wait_agent，实际为「${gateWarnings[0]}」`)
+  assert.match(gateWarnings[0], /snapshot boom/, `warn 必须带原始错误信息，实际为「${gateWarnings[0]}」`)
 })
 
 test('W6 事件含当前调用自身、本 turn 无更早 wait_agent：放行（next 1 次）', async (t) => {

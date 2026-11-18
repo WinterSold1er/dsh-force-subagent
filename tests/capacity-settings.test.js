@@ -237,25 +237,132 @@ test('/team-limit 带非法值：命令给出错误而不是半生效', async ()
 
 const SOURCE_FILES = ['../index.js', '../client.js']
 
+/** 写 / 改 / 删文件的 API：源码里出现任何一个调用点，就存在「把配置写进文件」的通道。 */
+const WRITE_FILE_APIS = [
+  'writeFile', 'writeFileSync', 'appendFile', 'appendFileSync', 'rename', 'renameSync',
+  'mkdir', 'mkdirSync', 'chmod', 'chmodSync', 'rm', 'rmSync', 'unlink', 'unlinkSync', 'createWriteStream',
+]
+/**
+ * 只读文件系统 API：内置 skills provider 读 <包目录>/skills/<name>/SKILL.md 走的就是这两个
+ * （readdir 枚举 skill 目录、readFile 读正文）。这是**只读**路径：它不产生任何写句柄，
+ * 也不构成「往 cordis.patch.yml 写东西」的通道，所以对 index.js 只禁写、不禁读。
+ */
+const READ_ONLY_FS_APIS = ['readdir', 'readdirSync', 'readFile', 'readFileSync']
+
+/** 调用点口径：`api(` 或 `fs.api(`；带前导单词字符的近似名（perform / confirm / reform）不算。 */
+const callSiteRe = (api) => new RegExp(`\\b(?:[A-Za-z_$][\\w$]*\\.)?${api}\\s*\\(`)
+/** 纯注释行（行首是双斜线、斜线星号或星号）：这些行只做说明，不是可执行路径。 */
+const COMMENT_ONLY_LINE_RE = /^\s*(?:\/\/|\/?\*\/?)/
+const NAMED_FS_IMPORT_RE = /import\s*\{([^}]*)\}\s*from\s*['"]node:fs(?:\/[A-Za-z]+)?['"]/g
+/** 非具名引入 node:fs：默认导入 / 命名空间导入 / require / 动态 import 都无法静态核对绑定。 */
+const OPAQUE_FS_IMPORT_RES = [
+  [/import\s+\*\s*(?:as\s+[\w$]+)?\s*from\s*['"]node:fs/, '命名空间导入 node:fs'],
+  [/import\s+[A-Za-z_$][\w$]*\s+from\s*['"]node:fs/, '默认导入 node:fs'],
+  [/require\s*\(\s*['"]node:fs/, 'require node:fs'],
+  [/\bimport\s*\(\s*['"]node:fs/, '动态 import node:fs'],
+]
+
+/**
+ * 纯函数（无 IO）：按 index.js 口径返回违规清单，空数组 = 合规。
+ * 判定口径：
+ * - 一切写 / 改 / 删文件 API 的调用点违规；`open(` 也算违规（打开文件句柄即可写）。
+ * - 文件系统导入只允许具名导入只读 API（readdir / readFile 及 Sync 变体）。
+ * - `cordis.patch.yml` 出现在**代码行**违规；出现在纯注释行不算——index.js:993 用它标注宿主
+ *   bundle 里 `subagent` 命名空间的位置、index.js:1116 声明插件不打开任何 patch 文件，
+ *   两处都是证据说明，不是可执行的 patch 读写路径。
+ * @param code - 待检查的源码文本
+ * @returns 违规说明列表
+ */
+function indexJsFileApiViolations(code) {
+  const violations = []
+  for (const line of String(code).split('\n')) {
+    if (!line.includes('cordis.patch.yml')) continue
+    if (COMMENT_ONLY_LINE_RE.test(line)) continue
+    violations.push(`代码行引用 cordis.patch.yml：${line.trim()}`)
+  }
+  for (const api of WRITE_FILE_APIS) {
+    if (callSiteRe(api).test(code)) violations.push(`调用写 / 改 / 删文件 API：${api}(`)
+  }
+  if (/\bopen\s*\(/.test(code)) violations.push('调用 open(')
+  for (const match of String(code).matchAll(NAMED_FS_IMPORT_RE)) {
+    for (const raw of String(match[1]).split(',')) {
+      const binding = raw.split(/\bas\b/)[0].trim()
+      if (binding !== '' && !READ_ONLY_FS_APIS.includes(binding)) violations.push(`导入文件系统 API：${binding}`)
+    }
+  }
+  for (const [re, label] of OPAQUE_FS_IMPORT_RES) {
+    if (re.test(code)) violations.push(`${label}（无法静态核对绑定）`)
+  }
+  return violations
+}
+
+/** 面板侧口径不变：client.js 连文件系统都不许碰，文案也不许声称往 patch 文件写东西。 */
+function clientFileApiViolations(code) {
+  const violations = []
+  if (code.includes('node:fs')) violations.push('引用 node:fs')
+  if (code.includes('cordis.patch.yml')) violations.push('引用 cordis.patch.yml')
+  return violations
+}
+
+test('守卫自检：违规样例必须红、合规样例必须绿（本守卫不是空断言）', () => {
+  const nonCompliant = [
+    "import { readdir, readFile, writeFileSync } from 'node:fs/promises'",
+    "await writeFile(join(root, 'cordis.patch.yml'), 'maxMembers: 1')",
+    'fs.rmSync(skillsRoot, { recursive: true })',
+    "const handle = await open(join(root, 'SKILL.md'), 'w')",
+  ].join('\n')
+  const violations = indexJsFileApiViolations(nonCompliant)
+  assert.ok(violations.length >= 5, `违规样例必须全部被抓出，实际：${JSON.stringify(violations)}`)
+  for (const needle of ['writeFile', 'writeFileSync', 'rmSync', 'open(', 'cordis.patch.yml']) {
+    assert.ok(violations.some((item) => item.includes(needle)), `违规样例的「${needle}」未被抓出：${JSON.stringify(violations)}`)
+  }
+  // 同名 API 走默认 / 命名空间导入时也必须红：绑定核对不是唯一防线。
+  assert.ok(indexJsFileApiViolations("import fs from 'node:fs'\nfs.writeFileSync(p, x)").length > 0, '默认导入 + fs.writeFileSync 必须红')
+  assert.ok(indexJsFileApiViolations("const { appendFileSync } = require('node:fs')").length > 0, 'require node:fs 必须红')
+
+  // 合规样例 = 内置 skills 的真实只读写法：必须绿，否则守卫就是在误伤只读路径。
+  const compliant = [
+    "import { readdir, readFile } from 'node:fs/promises'",
+    'const entries = await readdir(skillsRoot, { withFileTypes: true })',
+    "const text = await readFile(join(skillsRoot, name, 'SKILL.md'), 'utf8')",
+  ].join('\n')
+  assert.deepEqual(indexJsFileApiViolations(compliant), [], `只读加载 skills/<name>/SKILL.md 必须合规，实际：${JSON.stringify(indexJsFileApiViolations(compliant))}`)
+
+  // 近名 decoy：'rm' / 'open' 作为其它单词的组成部分不得误判（证明匹配是调用点口径，不是裸子串）。
+  const decoys = [
+    'function performWork({ confirm, inform, format }) { return confirm(inform) + format() + reform() }',
+    'const reopened = reopen(config); const normalize = normalise(value)',
+    '/** 插件不打开任何 cordis.patch.yml；容量写入只走宿主 settings / configForms */',
+  ].join('\n')
+  assert.deepEqual(indexJsFileApiViolations(decoys), [], `近名与纯注释说明不得误判：${JSON.stringify(indexJsFileApiViolations(decoys))}`)
+
+  assert.deepEqual(clientFileApiViolations("export const x = 1\n// 只读展示"), [], 'client.js 合规样例必须绿')
+  assert.deepEqual(clientFileApiViolations("import { readFileSync } from 'node:fs'"), ['引用 node:fs'], 'client.js 碰文件系统必须红')
+})
+
 test('插件源码不再引用任何成员上限配置键，也不再打开任何配置文件', async () => {
   const { readFileSync } = await import('node:fs')
   const { fileURLToPath } = await import('node:url')
   /** rc.2 的 agent-team 见到这些键会在构造期抛 TEAM_INVALID_CONFIG；插件一律不得再出现它们。 */
   const bannedKeys = ['maxMembers', 'maxMembersStatus', 'maxMessageBytes', 'disposalTimeoutMs']
-  /** 写配置文件需要文件系统 API：插件一个都不用，就不存在「写进 patch」这条路径。 */
-  const bannedFileApis = ['node:fs', 'writeFileSync', 'appendFileSync', 'renameSync', 'mkdirSync', 'chmodSync', 'createWriteStream']
-  for (const relative of SOURCE_FILES) {
-    const path = fileURLToPath(new URL(relative, import.meta.url))
-    const code = readFileSync(path, 'utf8')
+  const sources = SOURCE_FILES.map((relative) => ({
+    relative,
+    code: readFileSync(fileURLToPath(new URL(relative, import.meta.url)), 'utf8'),
+  }))
+  for (const { relative, code } of sources) {
     for (const needle of bannedKeys) {
       assert.ok(!code.includes(needle), `${relative} 不得再出现「${needle}」：agent-team 的 Config 已删除该字段`)
     }
-    for (const needle of bannedFileApis) {
-      assert.ok(!code.includes(needle), `${relative} 不得使用「${needle}」：容量写入只能走宿主 settings / configForms`)
-    }
   }
-  const clientCode = readFileSync(fileURLToPath(new URL('../client.js', import.meta.url)), 'utf8')
-  assert.ok(!clientCode.includes('cordis.patch.yml'), '面板文案不得再声称往 cordis.patch.yml 写东西')
+  // 面板侧：client.js 一律不得引用文件系统或 patch 文件。
+  const clientSource = sources.find((item) => item.relative === '../client.js')
+  assert.deepEqual(clientFileApiViolations(clientSource.code), [], `client.js 存在文件系统 / patch 通道：${JSON.stringify(clientFileApiViolations(clientSource.code))}`)
+  // 服务端：index.js 不得存在任何写、改、删文件的通道；只读加载内置 skills/<name>/SKILL.md 是允许的。
+  const indexSource = sources.find((item) => item.relative === '../index.js')
+  const indexViolations = indexJsFileApiViolations(indexSource.code)
+  assert.deepEqual(indexViolations, [], `index.js 存在文件写入通道：${JSON.stringify(indexViolations)}`)
+  // 只读路径必须确实存在（否则「允许只读」这条口径没有证据支撑）：内置 skills 的 SKILL.md 加载在源码里。
+  assert.ok(/from 'node:fs\/promises'/.test(indexSource.code), 'index.js 应通过 node:fs/promises 只读加载内置 skills')
 })
 
 test('插件 Config 里没有成员上限字段，面板写入不经过本插件命名空间', () => {

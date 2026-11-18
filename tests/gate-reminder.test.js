@@ -28,6 +28,15 @@ const COMMAND_NAME = 'using-agent-team'
 const PREFIX = '[team-gate]'
 const FINISHED_PREFIX = '[team-gate] TEAM_MEMBER_FINISHED:'
 
+/** 本文件统一探测成 team 档：team_task_create 可见（看板流程 + 已完成成员门禁启用）+ 全套委派工具。 */
+const TEAM_TOOL_NAMES = [
+  'team_task_create', 'team_task_list', 'team_task_claim', 'team_task_update',
+  'subagent', 'subagent_fork', 'send_message', 'list_agents', 'wait_agent', 'todo_write',
+  'bash', 'read', 'grep', 'glob', 'write', 'edit', 'run_code', 'web_fetch', 'web_search', 'read_image', 'pwsh',
+]
+/** 本步 toolSet 的替身：capabilitiesFor 按它做探测缓存，必须是稳定对象。 */
+const TOOL_SET = { id: 'test-tool-set' }
+
 /** 真实 ctx 的最小形状（与 tests/mode-flat.test.js 同一套夹具）。 */
 function createHost({ agentTeams } = {}) {
   const sections = []
@@ -40,7 +49,8 @@ function createHost({ agentTeams } = {}) {
       service === 'systemPrompt' ? { section: (definition) => { sections.push(definition) } }
         : service === 'commands' ? { register: (definition) => { registered.push(definition) } }
           : service === 'agentTeams' ? agentTeams
-            : undefined
+            : service === 'tools' ? { definitions: () => TEAM_TOOL_NAMES.map((name) => ({ name })) }
+              : undefined
     ),
     on: (...args) => { onCalls.push(args) },
     effect: (factory) => factory(),
@@ -110,7 +120,7 @@ async function runGate(host, tool, agent, args = {}, callId = `call-${tool}`) {
   let threw
   try {
     for (const handler of handlers) {
-      decisions.push(await handler({ name: tool, arguments: args, callId, agent, signal: new AbortController().signal }, () => { nextCalls += 1 }))
+      decisions.push(await handler({ name: tool, arguments: args, callId, agent, toolSet: TOOL_SET, signal: new AbortController().signal }, () => { nextCalls += 1 }))
     }
   } catch (error) {
     threw = error
@@ -219,21 +229,21 @@ test('门禁 5 已完成成员：放行 + 每个已完成成员只提醒一次',
   const host = applyGate('flat')
   const lead = agentOf({ id: 'lead-finished', events: leadEvents, membership: membershipOf({ role: 'lead', id: 'lead-1', name: 'lead', rootEvents: leadEvents }) })
   await assertRemindedOnce(
-    { tool: 'send_message', host, agent: lead, args: { target: 'worker-1', message: '再改一轮' } },
+    { tool: 'send_message', host, agent: lead, args: { agent: 'worker-1', message: '再改一轮' } },
     { label: 'Lead 发给已完成成员 worker-1', hint: /subagent/ },
   )
   assert.ok(lead.notices[0].content[0].text.startsWith(FINISHED_PREFIX), `提醒必须保留稳定前缀 ${FINISHED_PREFIX}`)
-  const repeated = await runGate(host, 'send_message', lead, { target: 'worker-1', message: '再改一轮' })
+  const repeated = await runGate(host, 'send_message', lead, { agent: 'worker-1', message: '再改一轮' })
   assert.equal(repeated.nextCalls, 1, '第二次同样放行')
   assert.equal(lead.notices.length, 1, `同一已完成成员只提醒一次，实际 ${lead.notices.length} 条`)
-  const other = await runGate(host, 'send_message', lead, { target: 'worker-2', message: '换个活' })
+  const other = await runGate(host, 'send_message', lead, { agent: 'worker-2', message: '换个活' })
   assert.equal(other.nextCalls, 1, '发给另一名已完成成员同样放行')
   assert.equal(lead.notices.length, 2, `不同已完成成员应各提醒一次，实际 ${lead.notices.length} 条`)
   // 反例：未完成成员（名下仍有 in_progress）不提醒。
   const busyHost = applyGate('flat')
   const busyEvents = [runEvent('on'), memberEvent('m3', 'worker-3'), taskEvent('t3', 'in_progress', 1, 'm3')]
   const busyLead = agentOf({ id: 'lead-busy-2', events: busyEvents, membership: membershipOf({ role: 'lead', id: 'lead-2', name: 'lead', rootEvents: busyEvents }) })
-  const busy = await runGate(busyHost, 'send_message', busyLead, { target: 'worker-3', message: '继续' })
+  const busy = await runGate(busyHost, 'send_message', busyLead, { agent: 'worker-3', message: '继续' })
   assert.equal(busy.nextCalls, 1, '未完成成员必须放行')
   assert.equal(busyLead.notices.length, 0, `未完成成员不得触发提醒，实际 ${busyLead.notices.length} 条`)
 })
@@ -267,21 +277,26 @@ const PARALLEL_RULES = ['拆成互不依赖的小任务', '单轮内并行 subag
 
 const sectionText = (host, agent) => {
   assert.equal(host.sections.length, 1, '必须恰好注册一个 systemPrompt section')
-  return host.sections[0].text({ agent })
+  // rc.2 文案按本步 toolSet 实时探测：必须带 toolSet，否则会走「探测失败 → standard 安全默认」而不是 team 档。
+  return host.sections[0].text({ agent, toolSet: TOOL_SET })
 }
 
-test('flat 模式提示词：Lead 段与成员段都要求「拆小任务 + 单轮并行 subagent + write_scopes 互斥 + 不串行」', () => {
+test('flat 模式提示词：Lead 段要求「拆小任务 + 单轮并行 subagent + write_scopes 互斥 + 不串行」，成员段声明「不派子代理、自己执行、不等其它成员」', () => {
   const leadEvents = [runEvent('on')]
   const host = createHost({ agentTeams: { tryMembership: (agent) => agent?.membership ?? undefined } })
   apply(host.ctx, { mode: 'flat' })
   const leadText = sectionText(host, agentOf({ id: 'prompt-lead', events: leadEvents }))
   const memberText = sectionText(host, agentOf({ id: 'prompt-member', events: [], membership: membershipOf({ rootEvents: leadEvents }) }))
-  for (const [name, text] of [['Lead 段', leadText], ['成员段', memberText]]) {
-    for (const rule of PARALLEL_RULES) {
-      assert.ok(text.includes(rule), `${name}必须包含「${rule}」，实际提示词为：${text}`)
-    }
-    assert.match(text, /flat 模式/, `${name}必须是 flat 模式提示词`)
+  // Lead 段才是拆解 / 派发方：四条并行派发口径必须逐字写进 Lead 提示词。
+  for (const rule of PARALLEL_RULES) {
+    assert.ok(leadText.includes(rule), `Lead 段必须包含「${rule}」，实际提示词为：${leadText}`)
   }
+  assert.match(leadText, /flat 模式/, 'Lead 段必须是 flat 模式提示词')
+  // 成员段不重复拆解口径（成员不拆任务），但必须声明 flat 语义：不派子代理、自己执行、不等其它成员。
+  assert.match(memberText, /flat 模式/, '成员段必须是 flat 模式提示词')
+  assert.match(memberText, /不派子代理/, `成员段必须声明「不派子代理」，实际：${memberText}`)
+  assert.match(memberText, /你自己执行/, `成员段必须声明自己执行分到的任务，实际：${memberText}`)
+  assert.match(memberText, /不要等其它成员/, `成员段必须声明做完即交回、不等其它成员，实际：${memberText}`)
   // 反例：nested 成员段不得出现 flat 口径（断言不是恒真）。
   const nestedHost = createHost({ agentTeams: { tryMembership: (agent) => agent?.membership ?? undefined } })
   apply(nestedHost.ctx, { mode: 'nested' })
@@ -294,11 +309,11 @@ test('门禁口径：Lead 段必须预先告知「取证 + 实现 + 执行」会
   apply(host.ctx, { mode: 'flat' })
   const leadText = sectionText(host, agentOf({ id: 'wording-lead', events: [runEvent('on')] }))
   const memberText = sectionText(host, agentOf({ id: 'wording-member', events: [], membership: membershipOf({ rootEvents: [runEvent('on')] }) }))
-  // Lead 段：点名工具集合与「提醒 + 放行」口径必须写进提示词，不能只靠被提醒后才知道。
-  const LEAD_BLOCKED_TOOLS = ['bash', 'pwsh', 'read', 'read_image', 'grep', 'glob', 'web_fetch', 'web_search', 'write', 'edit', 'apply_patch', 'str_replace_editor', 'run_code', 'terminal_open', 'terminal_read', 'terminal_send', 'terminal_signal']
-  for (const tool of LEAD_BLOCKED_TOOLS) {
-    assert.ok(leadText.includes(tool), `Lead 段必须点名会被提醒的工具「${tool}」，实际提示词：${leadText}`)
+  // rc.2 文案不再逐个枚举工具名（被点名的工具由提醒正文按当次真实调用给出）：提示词只声明「取证 / 实现 / 执行 + mcp__*」口径。
+  for (const category of ['取证', '实现', '执行']) {
+    assert.ok(leadText.includes(category), `Lead 段必须声明「${category}」类工具会触发提醒，实际提示词：${leadText}`)
   }
+  assert.match(leadText, /mcp__\*/, `Lead 段必须声明 mcp__* 等插件工具同样纳入提醒，实际：${leadText}`)
   assert.match(leadText, /\[team-gate\]/, `Lead 段必须给出提醒前缀 [team-gate]，实际：${leadText}`)
   assert.match(leadText, /提醒/, `Lead 段必须说明这些工具会收到提醒，实际：${leadText}`)
   assert.match(leadText, /工具照常执行/, `Lead 段必须说明工具照常执行（不是拒绝），实际：${leadText}`)
@@ -318,9 +333,10 @@ test('门禁口径：Lead 段必须预先告知「取证 + 实现 + 执行」会
   assert.match(nestedLeadText, /\[team-gate\]/, `nested Lead 段必须同样给出提醒前缀 [team-gate]，实际：${nestedLeadText}`)
   assert.match(nestedLeadText, /工具照常执行/, `nested Lead 段必须同样说明工具照常执行，实际：${nestedLeadText}`)
   assert.doesNotMatch(nestedLeadText, /LEAD_EVIDENCE_DENIED|会被硬拒|会被拒绝|已被门禁拦/, `nested Lead 段不得宣称硬拒绝，实际：${nestedLeadText}`)
-  for (const tool of ['write', 'edit', 'apply_patch', 'str_replace_editor', 'run_code', 'terminal_open', 'terminal_read', 'terminal_send', 'terminal_signal']) {
-    assert.ok(nestedLeadText.includes(tool), `nested Lead 段必须点名实现 / 执行工具「${tool}」，实际：${nestedLeadText}`)
+  for (const category of ['取证', '实现', '执行']) {
+    assert.ok(nestedLeadText.includes(category), `nested Lead 段必须同样声明「${category}」类工具，实际：${nestedLeadText}`)
   }
+  assert.match(nestedLeadText, /mcp__\*/, `nested Lead 段必须同样声明 mcp__* 工具口径，实际：${nestedLeadText}`)
 })
 
 test('软门禁提醒正文（成员侧 flat，工具已执行）：不得沿用硬拒绝口径', () => {

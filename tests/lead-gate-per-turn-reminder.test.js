@@ -3,11 +3,15 @@
  * 契约：提醒去重令牌 = 会话事件里最后一个 turn/start 的下标（index.js 的 `lead-evidence:${turnStart}`）。
  *   T1 同一轮连续两次命中只提醒一次；
  *   T2 新的 turn/start（新的用户消息开新一轮）之后重新提醒一次，累计 2 条 —— 本文件核心；
- *   T3 本轮已经 subagent 派发 → 命中工具放行且不提醒（同时充当 T1 / T2 的反例，证明断言不是恒真）；
+ *   T3 本轮已经 subagent 派发 → 命中工具仍放行，但「已派发」不再构成整轮静默：实现/执行类仍提醒一次，
+ *     仅 read / grep / glob 在已派发后按校验豁免不提醒；
  *   T4 源码断言：index.js 中 kind: 'deny' 出现 0 次，插件不返回任何拒绝结果；
  *   T5 17 个点名工具（取证 8 + 实现 4 + 执行 5）逐个：同轮内放行 + 恰好一次提醒。
  * 夹具与 tests/lead-gate-bypass-tools.test.js 同一口径：真实 Session 只暴露 snapshotEvents()，
- * Agent 的提醒通道是 agent.inject（notice 形态）。fail-open 场景见 tests/lead-gate.test.js（L8）。
+ * Agent 的提醒通道是 agent.inject（notice 形态）。
+ * rc.2 起能力由本步工具面探测：夹具显式提供 tools.definitions(scope, toolSet) 并让 exec 带 toolSet，
+ * 统一探测成 team 档（含 team_task_create），避免走「探测失败 → standard 安全默认」的告警路径。
+ * fail-open 场景见 tests/lead-gate.test.js（L8）。
  * 运行：node --test tests/
  */
 import test from 'node:test'
@@ -31,6 +35,15 @@ const runEvent = (args) => ({ type: 'command/run', data: { name: COMMAND_NAME, a
 const turnStart = (turn) => ({ type: 'turn/start', data: { turn } })
 const toolCall = (name) => ({ type: 'tool/call', data: { name } })
 
+/** 本文件统一探测成 team 档：team_task_create 可见（看板流程）+ 全套委派工具，T5 的「team_task_create → subagent」出路依赖它。 */
+const TEAM_TOOL_NAMES = [
+  'team_task_create', 'team_task_list', 'team_task_claim', 'team_task_update',
+  'subagent', 'subagent_fork', 'send_message', 'list_agents', 'wait_agent', 'todo_write',
+  'bash', 'read', 'grep', 'glob', 'write', 'edit', 'run_code', 'web_fetch', 'web_search', 'read_image', 'pwsh',
+]
+/** 本步 toolSet 的替身：capabilitiesFor 按它做探测缓存，必须是稳定对象。 */
+const TOOL_SET = { id: 'test-tool-set' }
+
 function createHost() {
   const warnings = []
   const onCalls = []
@@ -38,6 +51,7 @@ function createHost() {
     systemPrompt: { section: () => {} },
     commands: { register: () => {} },
     agentTeams: { tryMembership: () => undefined },
+    tools: { definitions: () => TEAM_TOOL_NAMES.map((name) => ({ name })) },
   }
   const ctx = {
     logger: { warn: (message) => warnings.push(message) },
@@ -90,6 +104,7 @@ async function callGate(host, tool, agent) {
         name: tool,
         arguments: {},
         agent,
+        toolSet: TOOL_SET,
         signal: new AbortController().signal,
       }, next))
     }
@@ -138,10 +153,20 @@ test('T2 新的 turn/start 之后再 bash：重新提醒一次（累计 2 条）
   assert.equal(agent.notices.length, 2, `T2：同一轮内换工具不得刷新提醒，实际 ${agent.notices.length} 条`)
 })
 
-test('T3 本轮已 subagent 派发：命中工具放行且不提醒', async () => {
-  const { host, agent } = leadFixture([runEvent('on'), turnStart(1), toolCall('team_task_create'), toolCall('spawn_teammate')])
+test('T3 本轮已 subagent 派发：命中工具仍放行，但同一轮只提醒一次（已派发不再构成整轮静默）', async () => {
+  const { host, agent } = leadFixture([runEvent('on'), turnStart(1), toolCall('team_task_create'), toolCall('subagent')])
   for (const tool of ['bash', 'write', 'run_code']) await assertAllowed(host, tool, agent, `T3 ${tool}`)
-  assert.equal(agent.notices.length, 0, `T3：本轮已派发不得投递提醒，实际 ${agent.notices.length} 条`)
+  // 新口径：实现/执行类在已派发后仍提醒（只提醒、不拦），同轮只一条且点明「本轮已派发」态。
+  assert.equal(agent.notices.length, 1, `T3：本轮已派发仍须提醒且同轮只一条，实际 ${agent.notices.length} 条`)
+  assert.match(
+    reminderText(agent.notices[0]),
+    /本轮已派发成员，但你仍在亲自执行/,
+    `T3：提醒必须点明「本轮已派发」态，实际「${reminderText(agent.notices[0])}」`,
+  )
+  assert.match(reminderText(agent.notices[0]), /「bash」/, `T3：首条提醒必须点名当次工具 bash，实际「${reminderText(agent.notices[0])}」`)
+  // 新口径：已派发后 read / grep / glob 视为校验产物，豁免提醒（同轮条数不变）。
+  for (const tool of ['read', 'grep', 'glob']) await assertAllowed(host, tool, agent, `T3 校验 ${tool}`)
+  assert.equal(agent.notices.length, 1, `T3：已派发后校验类工具不得刷新提醒，实际 ${agent.notices.length} 条`)
   assert.deepEqual(host.warnings, [], `T3：不得产生 fail-open warn，实际：${JSON.stringify(host.warnings)}`)
 })
 

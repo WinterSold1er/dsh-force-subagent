@@ -8,10 +8,10 @@
 
 ## 当前实现口径：命令门控的 `systemPrompt.section`
 
-`index.js` 现在声明 `export const inject = ['commands', 'systemPrompt', 'subagents']`，在 `apply` 里注册**一个** section 和一个命令、包裹 `subagents.startActivation` 注入子代理模型路由；不挂 `agent/pre-step`、不追加 user 消息、不写自定义会话事件类型：
+`index.js` 现在声明 `export const inject = ['commands', 'systemPrompt', 'subagents', 'tools']`，在 `apply` 里注册**一个** section 和一个命令、包裹 `subagents.startActivation` 注入子代理模型路由；不挂 `agent/pre-step`、不追加 user 消息、不写自定义会话事件类型：
 
 ```js
-export const inject = ['commands', 'systemPrompt', 'subagents']
+export const inject = ['commands', 'systemPrompt', 'subagents', 'tools']
 
 export function apply(ctx) {
   const systemPrompt = ctx.get('systemPrompt')
@@ -31,7 +31,7 @@ export function apply(ctx) {
 
 六条不变量：
 
-1. **inject 声明依赖**：Cordis 在 `commands`、`systemPrompt` 与 `subagents` 都就绪后才调用 `apply`（`subagents` 是子代理模型路由注入、包裹 `startActivation` 的前提）；`apply` 内 `ctx.get` 是一次性快照，返回空（isolate 场景）时 `ctx.logger.warn` 点名缺失服务并 `return`，插件停用而非静默降级。
+1. **inject 声明依赖**：Cordis 在 `commands`、`systemPrompt` 与 `subagents` 都就绪后才调用 `apply`（`subagents` 是子代理模型路由注入、包裹 `startActivation` 的前提）；`tools` 是能力探测的软依赖：缺失时按探测失败降级（standard 档文案 + 每次 apply 一条 warn），不阻塞 apply；`apply` 内 `ctx.get` 是一次性快照，返回空（isolate 场景）时 `ctx.logger.warn` 点名缺失服务并 `return`，插件停用而非静默降级。
 2. **状态不落盘**：门控派生自宿主已记录的 `command/run` 事件（`packages/interaction/commands/src/index.ts:373-378`），按会话天然隔离、幂等。
 3. **最新命令胜出**：`text` 从事件数组尾部向前找第一条 `command/run` 且 `data.name === 'using-agent-team'`；`args === 'off'` 返回 `''`，裸命令 / `on` / `<task>` 返回提醒，找不到事件返回 `''`。
 4. **section 名与顺序固定**：`force-subagent:agent-team`、order 57（与 director 的 `orchestrate-mode`/55 相邻但不撞值）。
@@ -46,7 +46,7 @@ export function apply(ctx) {
 - 必须传实时活着的同一个 `Agent` 对象引用：`AT/roster.ts:90` 用 `this.ctx.agents.get(agent.id) !== agent` 做引用相等校验，传 id 或过期对象会静默退化为 `undefined`。
 - `tryMembership` 同步、无 I/O、对调用者不抛错；`membership()` 会抛 `TEAM_NOT_MEMBER`（`AT/roster.ts:76-82`），每轮 assemble 的热路径只能用前者。
 - systemPrompt 的 `text` 提供器在每次 assemble 时重新求值、无缓存（`SP/index.ts:658-667`）；当前实现在全局 `ctx.systemPrompt.section` 注册，用 `context.agent.session` 读命令事件（`context.agent` 只作备选）。
-- 门禁由 `export const inject = ['commands', 'systemPrompt', 'subagents']` 保证：服务未就绪时 Cordis 不调用 `apply`，`ctx.get` 返回空时插件 warn 并停用；`subagents` 只用于包裹 `startActivation` 注入子代理模型路由；本插件不再依赖 `agentTeams`，开关来自会话内 `command/run` 事件（§6 为历史方案参考）。
+- 门禁由 `export const inject = ['commands', 'systemPrompt', 'subagents', 'tools']` 保证：服务未就绪时 Cordis 不调用 `apply`，`ctx.get` 返回空时插件 warn 并停用；`subagents` 只用于包裹 `startActivation` 注入子代理模型路由；本插件不再依赖 `agentTeams`，开关来自会话内 `command/run` 事件（§6 为历史方案参考）；`tools` 是能力探测的软依赖：缺失时按探测失败降级（standard 档文案 + 每次 apply 一条 warn），不阻塞 apply。
 
 ## 0. 版本与证据基线
 
@@ -270,7 +270,7 @@ export function assembleContextFor(agent: Agent, signal?: AbortSignal): Assemble
 
 - 谁启用 agent team：**profile bundle 层**。`~/.dsh/profiles/web/package.json` 的 `dsh.profile.bundles` 明确列有 `@deepseek-ai/dsh-experimental-agent-team-profile`；`dsh --profile web --dump-config` 里由该 bundle 插入三个插件：`agent-team`（`@deepseek-ai/dsh-experimental-agent-team`）、`tool-agent-team`、`ui-agent-team`。
 - 该 profile 层同时禁用 subagent 工具：`packages/experimental/agent-team-profile/cordis.patch.yml` 对 `tool-subagent-control`、`tool-subagent-list-agents`、`tool-subagent`、`tool-subagent-fork` 设 `disabled: true`；`--dump-config` 复核一致（`tool-subagent`、`tool-subagent-fork` 均 `disabled: true`）。
-- 服务存在 = 插件加载的判据，不是"该 agent 是成员"的判据：`inject` 里的服务缺失时 cordis 不进入 ACTIVE，`vendor/cordis/src/fiber.ts:611-617` 的 `_refresh()` 只要任一注入服务缺失就置 `INACTIVE`，`fiber.ts:316-318` 在发布后逐个 `_checkImpl(name)` 再 `_refresh()`。=> 历史方案用 `export const inject = ['agentTeams']` 让插件在无 agent-team 的部署里根本不 apply；当前实现的 inject 是 `['commands', 'systemPrompt', 'subagents']`。
+- 服务存在 = 插件加载的判据，不是"该 agent 是成员"的判据：`inject` 里的服务缺失时 cordis 不进入 ACTIVE，`vendor/cordis/src/fiber.ts:611-617` 的 `_refresh()` 只要任一注入服务缺失就置 `INACTIVE`，`fiber.ts:316-318` 在发布后逐个 `_checkImpl(name)` 再 `_refresh()`。=> 历史方案用 `export const inject = ['agentTeams']` 让插件在无 agent-team 的部署里根本不 apply；当前实现的 inject 是 `['commands', 'systemPrompt', 'subagents', 'tools']`（`tools` 是能力探测的软依赖：缺失时按探测失败降级，即 standard 档文案 + 每次 apply 一条 warn，不阻塞 apply）。
 - `TeamService` 本身是**全局单例、无 per-agent 门禁**（`AT/index.ts:56-108`，构造函数即注册服务）。=> 服务存在只说明"部署有 agent team 能力"；某个 agent 是否成员仍必须每轮 `tryMembership` 判定。
 - 实测风险：磁盘上的 profile 配置把 `tool-subagent`/`tool-subagent-fork` 置为 `disabled: true`，但当前运行中的会话仍暴露 `subagent`/`subagent_fork` 工具。=> **运行中的 host 早于当前磁盘配置启动**；不得用"配置文件内容"推断运行时行为，一律以运行时服务/结果为准。
 
@@ -326,13 +326,14 @@ ctx.on('agent/disposed', ({ agent }) => dispose(agent))      // TAT/index.ts:424
 
 `/using-agent-team` 开启时，插件包裹 `ctx.subagents.startActivation`，对**所有能接收子代理 `agentOptions` 的本地 in-process provider** 注入默认路由（`provider = 'dsh-opencode-go'` / `model = 'deepseek-v4.1-flash'`，可由插件 Config 的 `member` / `subagent` 字段分别配置；`enabled: false` 时完全透传）：显式 `provider` / `model` 一律被覆盖，`reasoningEffort` 一律删除，其余 `agentOptions` 字段（`maxTokens` 等）保留。成员判定 = `spec.childId` ∈ 父会话 `team/member` 事件登记的 `member.id` 集合（agent-team 在 `startActivation` 前写入该事件，`member.id` 就是预分配的 `childId`）；`childId` 存在本身不是判据。另两个必要条件是父会话 `/using-agent-team` 已开启，且该次激活所选 provider 的 `capabilities.agentOptions === true`。下列行号在 rc.5 树中核对。
 
-**Config 与两条路由**（`index.js` 的 `export const Config` / `resolveConfig` / `DEFAULT_CONFIG`）：
+**Config 与三条路由**（`index.js` 的 `export const Config` / `resolveConfig` / `DEFAULT_CONFIG` / `optionalRouteSchema` / `resolveRoute`；`reviewer` 是可选第三类）：
 
 | Config 字段 | 默认值 | 注入语义 |
 | :--- | :--- | :--- |
 | `enabled` | `true` | `false` 时包裹直接 `original.call(this, spec)`：原 `spec` 对象原样转发，`agentOptions` 逐字段不变、`reasoningEffort` 不删、不被默认路由覆盖。 |
 | `member.provider` / `member.model` | `dsh-opencode-go` / `deepseek-v4.1-flash` | `spec.childId` 命中 `memberIds(gateSession)`（root 会话 `team/member` 事件的 `member.id` 集合）时采用。 |
 | `subagent.provider` / `subagent.model` | `dsh-opencode-go` / `deepseek-v4.1-flash` | 其余激活采用：无 `childId`，或带 `childId` 但不在成员集合里。 |
+| `reviewer.provider` / `reviewer.model`（可选，全局或 `workspaces[key].reviewer`） | 无（`optionalRouteSchema` 两段默认空串，`DEFAULT_CONFIG` 不含 `reviewer` 键） | 仅当 `isReviewerActivation(spec, request)` 判定该激活是「审查代码」时才取用；`resolveRoute(live, workspaceKey, 'reviewer')` 返回 `undefined` 时 `kind` 保持 `member` / `subagent`，注入行为与引入该字段前完全一致。 |
 
 配置优先于调用方显式传参（force 语义）：命中后 `agentOptions` 由 `{ ...request.agentOptions, provider: route.provider, model: route.model }` 组装并 `delete agentOptions.reasoningEffort`——调用方给的 provider/model 一定被覆盖，`maxTokens` 一类字段保留，入参 `spec` 不被就地改写。`resolveConfig` 对缺省与非法值（非字符串、空串、非布尔 `enabled`、非对象路由）逐项回退默认且不抛，返回副本，`DEFAULT_CONFIG` 不会被调用方污染。profile 覆盖写法：
 
@@ -343,7 +344,12 @@ ctx.on('agent/disposed', ({ agent }) => dispose(agent))      // TAT/index.ts:424
     enabled: true
     member: { provider: dsh-opencode-go, model: deepseek-v4.1-flash }
     subagent: { provider: dsh-opencode-go, model: deepseek-v4.1-flash }
+    # reviewer: { provider: dsh-opencode-go, model: deepseek-v4.1-flash }   # 可选：整行省略 = 审查代码的激活回退 member / subagent 路由
 ```
+
+**`reviewer` 是可选第三类路由**：`optionalRouteSchema` 与 `routeSchema` 的唯一区别是默认值——两段空串而不是 `DEFAULT_ROUTE`，为的是让「没配 reviewer」在服务端保持 `undefined`；默认值填 `DEFAULT_ROUTE` 会让每次激活都强制覆盖。归一化在 `optionalRoute(value, location, warn)`：provider 与 model 都是非空字符串才算配置了；两段都空 / 缺失 / 非对象 → 返回 `undefined` 且 `resolveConfig` 不挂这个字段（`resolveConfig({})` 因此仍与 `DEFAULT_CONFIG` 深相等）；只配一半 → 整条忽略并按「配置位置」去重 warn 一次（全局 `reviewer` 与某个 `workspaces.<key>.reviewer` 各算一次），绝不注入「provider 配了、模型却是继承值」这种最难排查的残缺路由。`resolveRoute(settings, key, kind)` 对三类路由同一口径：`settings.workspaces[key][kind]` 存在就用它，否则取 `settings[kind]`；`kind = 'reviewer'` 时两层都没有就返回 `undefined`，由调用方回退该激活原本的 `member` / `subagent` 路由。
+
+**审查代码激活的识别**（`isReviewerActivation(spec, request)`，三段从严到宽）：`spec.name` 非空时只认 `REVIEWER_NAME_RE`（`^(?:[a-z0-9-]+-)?reviewer(?:-\d+)?$|^(?:code-)?review(?:-\d+)?$`，即 `reviewer`、`reviewer-1`、`code-reviewer`、`adversarial-reviewer`、`review`、`code-review-1` 这一类），不命中就直接判否、绝不回落到 label；`name` 为空时才试 `request.agentPreset`（同一套名字语法）；两者都空才试 label——label 判据只有两条：`REVIEWER_LABEL_RE` 与 `REVIEWER_NAME_RE`（整条 label 小写后本身就是一个 reviewer 名字）。`REVIEWER_LABEL_RE` 一律锚定在 label 开头——`^\s*(?:please\s+)?` 只容忍前置空白与 `please` 礼貌前缀，词组之后必须紧跟结尾或分隔符 `$ \s : ： - — ( （`；词组族为 ① `code[\s_-]*review(?:er)?`（`code review` / `code-review` / `codereview` / `code reviewer`），② `review` / `reviewing` 后必须接明确的代码审查宾语（可选冠词 `the` / `this` / `that` / `a` / `an`，宾语 `code` / `diff` / `pr` / `changes` / `impl\w*` / `patch` / `commit` / `pull request`，如 `review the diff`、`review impl`、`reviewing changes`），或整条 label 就是 `review` / `reviewing`（可带尾随空白），或 `review` / `reviewing` 紧跟冒号或左括号且其后只有**数字**轮次编号并到此结束（词族 `round` / `pass` / `iter` / `iteration` / `轮` / `第` / `批` / `次` + 可选空白 + 可选 `#` + **必需的数字**，或裸 `#数字` / 纯数字：命中 `review: round 2`、`review: pass 1`、`review: 第 3`、`review (第 3)`、`review (#3)`、`review (2)`；`review: round two`、`review: 3rd`、`review: 第 2 轮`、`review: 批次 7`、`review: round 2 附加说明` 判否——编号必须是数字且位于 label 结尾，缺冒号或左括号的 `review #3`、`review round 2` 同样判否）——带非代码宾语的写法（`review 需求文档`、`review 面板文案`、`review the docs`、`review 配置迁移`）一律判否，③ 中文族 `代码审查` / `审查代码` / `对抗审查` / `代码评审` / `评审代码`。**不做任意位置的子串匹配，旧版那条非锚定的 `REVIEWER_LABEL_PHRASE_RE`（`/\bcode[\s_-]+review(?:er)?\b/`）已删除**，审查词组只出现在 label 中间或末尾的实现类文案因此不命中。`spec.description` 从不参与判定；中文实现类 label（`实现审查代码模型`、`修复代码审查bug`）不命中。命中后 `kind = 'reviewer'`，`KIND_LABEL` 称它「审查代码」，注入语义与 `member` / `subagent` 完全相同（写顶层 `agentOptions`、删 `reasoningEffort`、rc.1 嵌套形状同步写回、入参 `spec` 不被就地修改）。
 
 `Config` 根节点 `.volatile()`，可写命名空间即 entry id `dsh-force-subagent`；注入侧读取的是 `apply(ctx, config)` 时的快照；配置文件/设置页改动由 HMR 触发 dispose + 重新 apply，无需重启，只有插件源码改动需要重启 host。换新的 `model` 必须同时把它加进 `subagent-model-selection-settings.config.allowedModels`，否则核心在 `assertAllowedModelSelection` 抛「not allowed」。
 
@@ -364,3 +370,22 @@ ctx.on('agent/disposed', ({ agent }) => dispose(agent))      // TAT/index.ts:424
 **为什么外部 provider 不注入**：`acp` / `codex` / `claude-code` / `dsh-sdk` 的 `capabilities.agentOptions === false`（它们的 `agentOptions` 语义是「合并到自己的实例默认值」，见 `types.ts:163-166`），核心在 `assertCapabilities`（`:631-651`）直接以 `UNSUPPORTED_CAPABILITY` 拒绝带 `agentOptions` 的激活。插件因此原样放行：不注入、不 warn、不猜名字——判据只有能力位。
 
 **失效模式**：会话状态不可读（无 session / 事件读不到 / 读取抛错）或 `getProvider` 抛错时，不注入、不抛、`ctx.logger.warn` 只打一次，命令与 `tools/pre-execute` 门禁不受影响；拿不到 provider（无 `getProvider` / 返回 `undefined` / 非对象）时同样不注入，但**不 warn**——provider 未注册不是插件故障。真实宿主的 `subagents` 服务是 traceable Proxy，每次读方法属性都返回新的函数 Proxy（保留 this 绑定），故 disposer 不做身份比较，而是 `delete` 本插件写在服务对象上的自有影子属性，让宿主 prototype 方法随之恢复（不回写原引用：那会留下自有影子属性永久遮蔽原型新方法）；卸载后再次 `apply` 会重新安装包裹，重复 `apply` 由 Symbol 守卫跳过并 warn 一次。需要随升级复核的口径只有一条：上游若把 `provider` 名换成新注册的 in-process provider，注入是否命中取决于其 `capabilities.agentOptions`，与名字无关。
+
+
+## 11. 内置 skills：随包 provider 注册契约
+
+插件包内 `skills/<name>/SKILL.md` 的 4 个技能（`team-adversarial-gatekeeper`、`team-lead-delegation`、`team-parallel-dispatch`、`team-recursive-orchestration`）由 `installSkillsProvider(ctx)` 注册进宿主 `skills` 服务，不需要把它们拷进 `~/.dsh/skills`。
+
+| 契约点 | 实现 |
+| :--- | :--- |
+| 注册时机 | `apply` 内调用 `installSkillsProvider(ctx)`。优先 `ctx.inject(['skills'], child => …)` 延迟注入：插件的静态 `inject = ['commands', 'systemPrompt', 'subagents', 'tools']` **不含** `skills`——写进去会让没装 skill 层的宿主整个插件不 apply，门禁静默失效。`ctx.inject` 不是函数时退化到 `ctx.get('skills')`。 |
+| provider 形状 | `createPackagedSkillProvider(skillsRoot, onError)` 返回宿主 `registerProvider` 的 create 回调：`{ name: 'dsh-force-subagent', list(options), get(candidate, options) }`。 |
+| 候选字段 | `list()` 每项 = frontmatter 出的 `{ name, description, whenToUse?, invocation: { modelInvocable: true, userInvocable: true }, source: 'custom', provider: 'dsh-force-subagent', metadata? }` 加上 `rank: 550`、`locator`（该 skill 目录）、`path`（`SKILL.md`）。`rank` 低于宿主 `BUNDLED_SKILL_RANK = 600`（打包 provider 与本地 bundled 根共用的标准优先级）；`source` 是 prompt 可见的来源桶，不是优先级。 |
+| 重名去重 | 宿主 skill registry 的真实契约是「**跨层由最近的一层直接胜出，`rank` 只在同一层内决定重名**」（`packages/skill/skill/src/index.ts` 的 `collectFresh`：「the nearest layer's same-name entry replaces the farther ones … Rank decides duplicates only within one layer」；`SkillCandidate.rank` 的注释同一口径）。provider 落在哪一层由它挂在哪决定——插件若挂在 agent preset 的 standing composition 上就落在该 preset 层。宿主侧常量：`BUNDLED_SKILL_RANK = 600`（同文件）、`USER_DSH_RANK = 400`、`USER_AGENTS_RANK = 500`（`packages/skill/skill-filesystem/src/index.ts`），这些 rank 只在各自层内比较，不能拿来跨层排序。条件式结论（不是无条件事实）：若本插件 provider 与 `~/.dsh/skills` 同在 global 层，两者同层时 400 更小，同名条目（`team-parallel-dispatch` 等）才由 `~/.dsh/skills` 那份胜出、本插件的 550 只在同层内胜过 bundled 根 600；若插件 provider 落在更近的层，同名会由本插件胜出，与 550 / 400 的大小无关。当前实际状态（2026-11-18 14:05 起）：`~/.dsh/skills/team-*` 四份旧拷贝已迁移到 `~/.dsh/backups/skills-team-20261118-140511/`，`~/.dsh/skills` 已无同名条目，因此当前命中的是随包 provider（550）；若日后把旧拷贝放回 `~/.dsh/skills`，同层按 rank 400 胜出。确认命中来源的步骤见 `docs/install.md` 的自检（按当前状态，它会显示随包版本）。 |
+| 正文延迟读 | `list()` 只读 frontmatter，正文留到 `get(candidate)`：返回 `{ ...fields, resourceBase: { kind: 'directory', path: <locator> }, path: <SKILL.md>, content: <正文> }`，`resourceBase` 供宿主解析正文里的相对引用。 |
+| 目录根 | `PACKAGED_SKILLS_ROOT = join(dirname(fileURLToPath(import.meta.url)), 'skills')`：包自身的装配事实，不是用户配置。`ENOENT`（本包没有 `skills` 目录）按空候选集合处理，不 warn。 |
+| 名字 | frontmatter 的 `name`，缺省用目录名；必须匹配 `SKILL_NAME_RE`（小写字母 / 数字 / 连字符），否则该候选跳过并 warn。 |
+| 降级 | 服务缺失（headless 组合 / 未装 skill 层的宿主）：`hasSkills` 为假就安静返回，不抛也不 warn，门禁、委派提示与路由注入照旧。真实的目录读取失败、SKILL.md 缺 frontmatter、名字非法，经 `warnSkills` 同一原因只 warn 一次（模块级 Set、每进程一次，按问题文案去重；同一问题在本进程内再次出现不会重复告警，重启 / 热重载重新 apply 后才重新计数）。 |
+| 注销 | `inject` 路径的 provider 由该注入 scope 托管；退化路径把 `registerProvider` 返回的注销器交给 `ctx.effect(…, 'force-subagent:skills provider')`。插件 scope 销毁即注销。 |
+
+四个技能正文已按 0.2.2-rc.2 的真实工具面收编：成员用 `subagent` / `subagent_fork` 拉起（无 `spawn_teammate`），看板用 `todo_write` 这类真实工具，模型与思考强度由 §10 的三张路由卡决定（派发调用不手动传 `provider` / `model` / `reasoning_effort`），审查员成员命名 `reviewer` 以命中「审查代码模型」。

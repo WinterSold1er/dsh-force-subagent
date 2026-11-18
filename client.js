@@ -196,11 +196,14 @@ window.__ModuleLoader__.load({
     function buildDraft(workspaces, key) {
       var member = routeAt(workspaces, key, 'member');
       var subagent = routeAt(workspaces, key, 'subagent');
+      var reviewer = routeAt(workspaces, key, 'reviewer');
       return {
         memberProvider: member.provider,
         memberModel: member.model,
         subagentProvider: subagent.provider,
         subagentModel: subagent.model,
+        reviewerProvider: reviewer.provider,
+        reviewerModel: reviewer.model,
       };
     }
 
@@ -215,8 +218,10 @@ window.__ModuleLoader__.load({
       Object.keys(existing).forEach(function (name) { record[name] = existing[name]; });
       var route = routeOf(draft && { provider: draft.memberProvider, model: draft.memberModel });
       var subagent = routeOf(draft && { provider: draft.subagentProvider, model: draft.subagentModel });
+      var reviewer = routeOf(draft && { provider: draft.reviewerProvider, model: draft.reviewerModel });
       record.member = { provider: route.provider, model: route.model };
       record.subagent = { provider: subagent.provider, model: subagent.model };
+      record.reviewer = { provider: reviewer.provider, model: reviewer.model };
       next[key] = record;
       return next;
     }
@@ -235,7 +240,7 @@ window.__ModuleLoader__.load({
     /**
      * 「保存设置到所有工作区」的 workspaces 字典，与 buildWorkspacesMutation 同构：
      * 整表浅拷贝（不修改入参），既有条目与条目上的其它字段原样保留；
-     * 再把当前 draft 的 member / subagent 路由广播到枚举出的每个工作区键，
+     * 再把当前 draft 的 member / subagent / reviewer 路由广播到枚举出的每个工作区键，
      * 返回「既有键 ∪ 枚举键」的并集。
      */
     function buildAllWorkspacesMutation(currentWorkspaces, items, draft) {
@@ -244,12 +249,14 @@ window.__ModuleLoader__.load({
       Object.keys(source).forEach(function (name) { next[name] = source[name]; });
       var route = routeOf(draft && { provider: draft.memberProvider, model: draft.memberModel });
       var subagent = routeOf(draft && { provider: draft.subagentProvider, model: draft.subagentModel });
+      var reviewer = routeOf(draft && { provider: draft.reviewerProvider, model: draft.reviewerModel });
       enumerableWorkspaceKeys(items).forEach(function (key) {
         var existing = isObject(source[key]) ? source[key] : {};
         var record = {};
         Object.keys(existing).forEach(function (name) { record[name] = existing[name]; });
         record.member = { provider: route.provider, model: route.model };
         record.subagent = { provider: subagent.provider, model: subagent.model };
+        record.reviewer = { provider: reviewer.provider, model: reviewer.model };
         next[key] = record;
       });
       return next;
@@ -281,16 +288,45 @@ window.__ModuleLoader__.load({
       return operations;
     }
 
-    function draftIsValid(draft) {
-      var pairs = [
-        [draft.memberProvider, draft.memberModel],
-        [draft.subagentProvider, draft.subagentModel],
-      ];
-      return pairs.every(function (pair) {
-        var provider = nonEmptyString(pair[0]) ? pair[0] : '';
-        var model = nonEmptyString(pair[1]) ? pair[1] : '';
-        return (provider === '' && model === '') || (provider !== '' && model !== '');
+    /** 三组模型路由的字段表：卡片、校验与禁用提示都只认这一张表，新增一组路由不会漏掉校验。 */
+    var ROUTE_GROUPS = [
+      { providerField: 'memberProvider', modelField: 'memberModel', label: '成员模型' },
+      { providerField: 'subagentProvider', modelField: 'subagentModel', label: '子代理模型' },
+      { providerField: 'reviewerProvider', modelField: 'reviewerModel', label: '审查代码模型' },
+    ];
+
+    /** 单组路由的合法性口径：provider 与 model 必须「都为空」或「都非空」。 */
+    function routePairValid(provider, model) {
+      var hasProvider = nonEmptyString(provider) ? provider : '';
+      var hasModel = nonEmptyString(model) ? model : '';
+      return (hasProvider === '' && hasModel === '') || (hasProvider !== '' && hasModel !== '');
+    }
+
+    /**
+     * 第一组「provider 与 model 不成对」的路由卡名；全合法返回 ''。
+     * 提示必须点名是哪张卡：三张卡共用一句不带主语的「需成对选择」会把用户支到别的路由上去改。
+     * 空值口径与 routeOf / buildWorkspacesMutation 一致：draft 不是对象（null / undefined / 字符串之类）
+     * 一律视为「三组路由都继承默认」= 合法，返回 ''，不谎报卡名、也不抛 TypeError。
+     */
+    function invalidRouteLabel(draft) {
+      var source = isObject(draft) ? draft : {};
+      var found = '';
+      ROUTE_GROUPS.forEach(function (group) {
+        if (found !== '') return;
+        if (!routePairValid(source[group.providerField], source[group.modelField])) found = group.label;
       });
+      return found;
+    }
+
+    /**
+     * draft 是否可提交。语义完全由 invalidRouteLabel 决定，空值语义也随之确定：
+     * 非对象（null / undefined / 非对象标量）→ 视为全继承默认 → 合法 → true。
+     * 面板的两个调用点（保存前的 invalidGroup 提示、保存前的 draftIsValid 拦截）拿到的 draft
+     * 来自 React state（初始即六字段对象，且只会被 buildDraft 替换），所以这条防御不改变线上路径，
+     * 只是把「缺空值防御」从测试里记录的缺陷变成真正的防御。
+     */
+    function draftIsValid(draft) {
+      return invalidRouteLabel(draft) === '';
     }
 
     /** 成员容量护栏，与宿主侧 index.js `MAX_CAPACITY_LIMIT` 对齐（真正的执行上限由宿主 subagent 服务持有）。 */
@@ -368,15 +404,31 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 把 `current` 归一成「当前路由列表」：既接受单个 { provider, model }（旧签名），
+     * 也接受一组当前路由（成员 / 子代理 / 审查各一条，或再加 inherited）。
+     * 非对象与全空条目被丢掉，绝不产出 provider 为空的候选组。
+     */
+    function routesOf(value) {
+      var list = Array.isArray(value) ? value : [value];
+      var routes = [];
+      list.forEach(function (entry) {
+        var route = routeOf(entry);
+        if (route.provider === '' && route.model === '') return;
+        routes.push(route);
+      });
+      return routes;
+    }
+
+    /**
      * 合并允许模型策略与模型目录，产出下拉选项。
-     * input: { policy, catalog, current }
+     * input: { policy, catalog, current }（`current` 可为单个路由或路由数组；另有可选 `currents` 数组）
      * 返回: { status, source, providers:[{provider,label,models:[{model,label}]}] }
      */
     function buildModelOptions(input) {
       var source = isObject(input) ? input : {};
       var policy = isObject(source.policy) ? source.policy : null;
       var catalog = isObject(source.catalog) ? source.catalog : null;
-      var current = routeOf(source.current);
+      var currents = routesOf(source.current).concat(routesOf(source.currents));
       var groups = [];
       var byId = Object.create(null);
       var status = 'ready';
@@ -426,7 +478,9 @@ window.__ModuleLoader__.load({
         status = 'error';
       }
 
-      if (current.provider) add(current.provider, current.model);
+      currents.forEach(function (current) {
+        if (current.provider) add(current.provider, current.model);
+      });
 
       if (groups.length === 0 && status === 'ready') status = 'empty';
 
@@ -852,7 +906,9 @@ window.__ModuleLoader__.load({
         var keyState = React.useState(null);
         var selectedKey = keyState[0], setSelectedKey = keyState[1];
         var draftState = React.useState({
-          memberProvider: '', memberModel: '', subagentProvider: '', subagentModel: '',
+          memberProvider: '', memberModel: '',
+          subagentProvider: '', subagentModel: '',
+          reviewerProvider: '', reviewerModel: '',
         });
         var draft = draftState[0], setDraft = draftState[1];
         var hostGlobals = hostGlobalsOf(snapshot.value);
@@ -918,6 +974,7 @@ window.__ModuleLoader__.load({
         var inherited = {
           member: routeOf(value.member),
           subagent: routeOf(value.subagent),
+          reviewer: routeOf(value.reviewer),
         };
         var memberOptions = buildModelOptions({ policy: policySnapshot, catalog: catalog, current: {
           provider: draft.memberProvider, model: draft.memberModel,
@@ -925,11 +982,18 @@ window.__ModuleLoader__.load({
         var subagentOptions = buildModelOptions({ policy: policySnapshot, catalog: catalog, current: {
           provider: draft.subagentProvider, model: draft.subagentModel,
         } });
+        /** 审查路由的候选同时并入本工作区已存的 reviewer 与全局 reviewer：
+         *  否则「留空则回退」指向的那个模型选不回来，策略白名单外也复用它就得手填。 */
+        var reviewerOptions = buildModelOptions({ policy: policySnapshot, catalog: catalog, current: [
+          { provider: draft.reviewerProvider, model: draft.reviewerModel },
+          inherited.reviewer,
+        ] });
 
         var editable = snapshot.status === 'ready' && selectedKey !== null && selectedKey !== undefined && busy !== true;
         /** 全局开关与委派模式不属于某个工作区：快照就绪就可编辑，未选中时也必须显示宿主真值而不是灰态占位。 */
         var globalsEditable = snapshot.status === 'ready' && busy !== true;
-        var valid = draftIsValid(draft);
+        var invalidGroup = invalidRouteLabel(draft);
+        var valid = invalidGroup === '';
         var canSave = editable && valid;
         /** 广播也必须先选中工作区：要写进各工作区的模型路由就是选中那个工作区 draft 里的，未选中就没有可广播的路由。
          * `allWorkspaceKeys.length > 0` 是纵深防御，UI 上目前走不到：工作区被清空时上面的 useEffect 会把 selectedKey 归 null，
@@ -1137,7 +1201,7 @@ window.__ModuleLoader__.load({
             return;
           }
           if (!draftIsValid(draft)) {
-            showFailure('provider 与 model 需成对选择');
+            showFailure(invalidGroup + '的 provider 与 model 需成对选择');
             return;
           }
           var globals = resolveGlobalFields(fresh.value);
@@ -1200,14 +1264,14 @@ window.__ModuleLoader__.load({
           return list;
         }
 
-        function renderRouteCard(title, description, options, inheritedRoute, providerField, modelField) {
+        function renderRouteCard(title, description, options, inheritedRoute, providerField, modelField, emptyHint) {
           var provider = draft[providerField];
           var model = draft[modelField];
           var group = providerGroupOf(options, provider);
           var noModels = provider !== '' && (group === null || group.models.length === 0);
           var providerHint = inheritedRoute.provider
             ? '留空则继承全局默认：' + routeText(inheritedRoute)
-            : '留空则继承全局默认路由';
+            : (emptyHint === undefined || emptyHint === '' ? '留空则继承全局默认路由' : emptyHint);
           var modelHint = provider === ''
             ? '选择 provider 后可选模型'
             : noModels ? '该 provider 暂无可选模型' : ('当前：' + routeText({ provider: provider, model: model }));
@@ -1303,7 +1367,7 @@ window.__ModuleLoader__.load({
         var disabledReason = '';
         if (snapshot.status !== 'ready') disabledReason = '配置不可用';
         else if (selectedKey === null || selectedKey === undefined) disabledReason = '请选择工作区';
-        else if (!valid) disabledReason = 'provider 与 model 需成对选择';
+        else if (!valid) disabledReason = invalidGroup + '的 provider 与 model 需成对选择';
         else if (busy === true) disabledReason = '保存中…';
 
         /* 「保存设置到所有工作区」与「保存设置」一样要求先选中工作区：广播的路由来自选中那个工作区的 draft。
@@ -1314,7 +1378,7 @@ window.__ModuleLoader__.load({
           allDisabledReason = workspaceError !== '' ? '工作区列表不可用：' + workspaceError : '未发现任何工作区';
         }
         else if (selectedKey === null || selectedKey === undefined) allDisabledReason = '请先选择一个工作区，再应用到所有已枚举的工作区';
-        else if (!valid) allDisabledReason = 'provider 与 model 需成对选择';
+        else if (!valid) allDisabledReason = invalidGroup + '的 provider 与 model 需成对选择';
         else if (snapshot.status !== 'ready') allDisabledReason = '配置不可用';
         else if (busy === true) allDisabledReason = '保存中…';
 
@@ -1358,6 +1422,8 @@ window.__ModuleLoader__.load({
             memberOptions, inherited.member, 'memberProvider', 'memberModel'),
           renderRouteCard('子代理模型', '普通 subagent 使用的模型路由',
             subagentOptions, inherited.subagent, 'subagentProvider', 'subagentModel'),
+          renderRouteCard('审查代码模型', '审查代码成员 / 子代理（如 name="reviewer"）单独使用的模型路由；留空则回退到成员 / 子代理路由',
+            reviewerOptions, inherited.reviewer, 'reviewerProvider', 'reviewerModel', '留空则回退到成员 / 子代理路由'),
           h('section', { className: 'fsx-card fsx-field' },
             renderSelect('fsx-mode', '委派模式', 'A：成员可派子代理；B：只用成员，成员不再派子代理。', mode,
               globalsEditable !== true,
@@ -1493,6 +1559,7 @@ window.__ModuleLoader__.load({
         buildAllWorkspacesMutation: buildAllWorkspacesMutation,
         enumerableWorkspaceKeys: enumerableWorkspaceKeys,
         draftIsValid: draftIsValid,
+        invalidRouteLabel: invalidRouteLabel,
         parseMemberLimit: parseMemberLimit,
         parseDepthLimit: parseDepthLimit,
         capacityStatusText: capacityStatusText,
